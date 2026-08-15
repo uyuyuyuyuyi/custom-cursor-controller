@@ -1,7 +1,8 @@
 # PyInstaller
 build/
-dist/
+/dist/
 *.spec
+!CustomCursorController.spec
 
 # Python
 __pycache__/
@@ -21,7 +22,6 @@ test_*.cur
 
 # Preview images
 *_preview.png
-cockroach_tray_icon.png
 
 # Runtime generated resources (程序首次运行自动生成)
 resources/

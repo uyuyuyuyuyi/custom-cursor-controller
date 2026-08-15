@@ -1,11 +1,11 @@
 """
-cockroach_gui_web.pyw — 自定义光标控制器（pywebview 桌面窗口版）
+custom_cursor_gui.pyw — 自定义光标控制器（pywebview 桌面窗口版）
 
 用 pywebview (WebView2) 承载 Vue 3 前端，Python 后端提供本地 HTTP API。
 
 用法:
-    pythonw cockroach_gui_web.pyw          # 正常启动
-    python cockroach_gui_web.pyw --smoke   # 冒烟测试: 6 秒后自动退出
+    pythonw custom_cursor_gui.pyw          # 正常启动
+    python custom_cursor_gui.pyw --smoke   # 冒烟测试: 6 秒后自动退出
 """
 
 import atexit
@@ -121,7 +121,7 @@ def main() -> None:
             on_quit()
 
         tray = pystray.Icon(
-            name="cockroach_cursor_web",
+            name="custom_cursor_controller",
             title="自定义光标控制器",
             icon=_placeholder_icon(64),
             menu=pystray.Menu(

@@ -7,8 +7,8 @@ The project started as the 🪳 white animated cockroach cursor, and grew into a
 
 本项目起源于 🪳 白色蟑螂动画光标，现已成长为一个完整的自定义光标控制器：上传任意图片（或 GIF）→ 自动适合度分析 → 生成 `.ani` 光标 → 一键开关 → Vue 现代化界面 + 图库管理。
 
-Programmatically drawn (PIL), pure-Python built `.ani` files, and installed via the Win32 API — no C compiler, no third-party drawing libraries.
-程序化绘制（PIL）、纯 Python 手工构建 `.ani` 文件，并通过 Win32 API 注入系统——无需 C 编译器，无第三方绘图库。
+Programmatically built `.ani` files (pure Python), image analysis & background removal via PIL, installed via the Win32 API — no C compiler, no third-party drawing libraries.
+纯 Python 手工构建 `.ani` 文件，PIL 完成图片分析与抠背景，并通过 Win32 API 注入系统——无需 C 编译器，无第三方绘图库。
 
 ---
 
@@ -22,7 +22,7 @@ Programmatically drawn (PIL), pure-Python built `.ani` files, and installed via 
 | 🎯 点击预览设置**热点**；↺/↻ **旋转 90°**；**光标大小** 48/64/96 可选 | Click-to-set **hotspot**; ↺/↻ **rotate 90°**; **cursor size** 48/64/96 selectable |
 | 🗂 **图库**：所有上传图片与生成光标存于程序目录 `data/`，可查看 / 应用 / 重命名 / 归类 / 删除 | **Gallery**: all uploads & cursors stored in `data/`, view / apply / rename / categorize / delete |
 | 🔍 **内容查重**（SHA-256）：重复上传相同内容时提示，可选择取消（自动清理） | **Content dedup** (SHA-256): duplicate uploads are flagged; cancel auto-cleans the new copies |
-| 🪳 经典蟑螂光标（项目起源）：8 帧三足步态爬行动画，托盘驻留 | The classic cockroach cursor (project origin): 8-frame tripod-gait animation, tray resident |
+| 🪳 经典蟑螂光标是项目的起源（现已演化为通用控制器） | The classic cockroach cursor is where the project started (now a general-purpose controller) |
 | 💾 备份原始光标，退出时自动恢复 | Backs up the original cursor and restores it on exit |
 | 📦 纯 Python 构建 `.ani`（RIFF/ACON），帧内嵌 PNG 压缩 `.cur` | `.ani` (RIFF/ACON) built in pure Python, frames embedded as PNG-compressed `.cur` |
 
@@ -57,20 +57,15 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # 3. Run the GUI (pywebview window hosting the Vue frontend)
-python cockroach_gui_web.pyw
+python custom_cursor_gui.pyw
 ```
 
 > 前端已构建好的版本在 `webui/dist`；如需重新构建：`cd webui && npm install && npm run build`。
 
 ### Pre-built executable / 直接使用打包好的程序
 
-Run `dist\CockroachCursorGUIWeb.exe` — double-click to enter the GUI.
-运行 `dist\CockroachCursorGUIWeb.exe` —— 双击进入图形界面。
-
-### Legacy tray app / 旧版托盘程序
-
-`python cockroach_cursor.pyw` — replaces the arrow with the classic white cockroach cursor and stays in the system tray (no GUI).
-`python cockroach_cursor.pyw` —— 用经典白色蟑螂光标替换箭头并驻留系统托盘（无图形界面）。
+Run `dist\CustomCursorController.exe` — double-click to enter the GUI.
+运行 `dist\CustomCursorController.exe` —— 双击进入图形界面。
 
 ---
 
@@ -94,14 +89,8 @@ Run `dist\CockroachCursorGUIWeb.exe` — double-click to enter the GUI.
 ```bash
 pip install pyinstaller
 
-# Web GUI (recommended) / Web 版（推荐）
-pyinstaller CockroachCursorGUIWeb.spec --noconfirm        # → dist\CockroachCursorGUIWeb.exe
-
-# tkinter GUI / 旧版图形界面
-pyinstaller CockroachCursorGUI.spec --noconfirm           # → dist\CockroachCursorGUI.exe
-
-# Classic tray app / 经典托盘程序（资源内嵌）
-pyinstaller CockroachCursor.spec --noconfirm              # → dist\CockroachCursor.exe
+# Web GUI / Web 版（推荐）
+pyinstaller CustomCursorController.spec --noconfirm        # → dist\CustomCursorController.exe
 ```
 
 > Web 版打包前需先构建前端：`cd webui && npm install && npm run build`（产物在 `webui/dist`，已随打包内嵌）。
@@ -111,43 +100,28 @@ pyinstaller CockroachCursor.spec --noconfirm              # → dist\CockroachCu
 ## 📁 Project structure / 项目结构
 
 ```
-cockroach/
-├── cockroach_gui_web.pyw  # Web GUI entry: pywebview window + Vue frontend
-│                          # 图形界面（Web 版）入口：pywebview 窗口承载 Vue 前端
+custom-cursor-controller/
+├── custom_cursor_gui.pyw  # Web GUI entry: pywebview window + Vue frontend
+│                          # 图形界面入口：pywebview 窗口承载 Vue 前端
 ├── gui_server.py          # Local HTTP API server (upload/analyze/apply/gallery/dedup)
 │                          # 本地 HTTP API 后端（上传/分析/应用/图库/查重）
+├── cursor_manager.py      # Win32 cursor backup/replace/restore (CursorManager)
+│                          # Win32 光标管理（备份/替换/恢复）
 ├── webui/                 # Vue 3 + Vite frontend source (build output in webui/dist)
 │                          # Vue 3 前端源码（构建产物 webui/dist 由后端托管）
 ├── pointer_analyzer.py    # Suitability scoring + auto background removal (with multi-frame
 │                          # consistency for GIFs) 图片适合度分析 + 自动抠背景（含 GIF 帧一致性）
 ├── ani_builder.py         # Pure-Python RIFF/ACON (.ani) binary builder
 │                          # 纯 Python 的 RIFF/ACON (.ani) 二进制构建器
-├── cockroach_cursor.pyw   # Legacy tray app + Win32 cursor management (CursorManager)
-│                          # 旧版托盘程序 + Win32 光标管理
-├── cockroach_gui.pyw      # Legacy tkinter GUI (upload → check → toggle)
-│                          # 旧版 tkinter 图形界面
-├── cursor_drawer.py       # Drawing engine: 48×48 white cockroach, 8-frame animation
-│                          # 绘图引擎：48×48 白色蟑螂，8 帧动画
-├── make_custom_cursor.py  # CLI: build a .ani from your own PNGs
-│                          # 命令行：用 PNG 生成 .ani
-├── build_resources.py     # One-shot: generate resources/ + validate RIFF header
-│                          # 一次性脚本：生成 resources/ 并校验 RIFF 头
 ├── test_web_api.py        # End-to-end API tests (60 checks, incl. real cursor swap)
 │                          # API 端到端测试（60 项，含真实光标替换）
-├── diagnose_ani.py        # Check whether Windows can load the .ani
-│                          # 检查 Windows 能否加载该 .ani
-├── diagnose_frames.py     # Deep-dive: parse internal fram LIST, dump each frame PNG
-│                          # 深度诊断：解析内部 fram LIST，导出每帧 PNG
-├── CockroachCursorGUIWeb.spec  # PyInstaller spec for the Web GUI (embeds webui/dist)
-│                          # Web 版打包配置（内嵌前端）
-├── CockroachCursorGUI.spec    # PyInstaller spec for the tkinter GUI
-│                          # tkinter 版打包配置
-├── CockroachCursor.spec       # PyInstaller spec for the classic tray app
-│                          # 经典托盘程序打包配置（资源内嵌）
+├── CustomCursorController.spec  # PyInstaller spec (embeds webui/dist)
+│                          # 打包配置（内嵌前端）
 ├── requirements.txt       # pystray + Pillow + pywebview + pythonnet
 ├── data/                  # User data (created at runtime): uploads/ + cursors/ + index.json
 │                          # 用户数据（运行时创建）：上传图片与生成的光标
-└── dist/                  # Build output / 打包产物
+└── dist/                  # Build output: CustomCursorController.exe
+                           # 打包产物
 ```
 
 ---
@@ -189,10 +163,6 @@ cockroach/
   端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性（60 项，会短暂替换真实光标）。
 - `python -m ani_builder` — writes a 2-frame test cursor `test_cursor.ani`.
   生成两帧测试光标 `test_cursor.ani`。
-- `python diagnose_ani.py` — verifies the built `.ani` loads via `LoadCursorFromFileW`.
-  验证生成的 `.ani` 可被 Windows 加载。
-- `python diagnose_frames.py` — parses the `fram` LIST and exports each frame PNG to `resources/frame_*.png`.
-  解析 `fram` LIST 并导出每帧 PNG 到 `resources/frame_*.png`。
 
 ---
 

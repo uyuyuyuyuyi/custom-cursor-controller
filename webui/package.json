@@ -1,5 +1,5 @@
 {
-  "name": "cockroach-cursor-webui",
+  "name": "custom-cursor-controller-webui",
   "private": true,
   "version": "1.0.0",
   "type": "module",
