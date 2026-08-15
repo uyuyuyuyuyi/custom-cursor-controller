@@ -20,7 +20,7 @@ Programmatically built `.ani` files (pure Python), image analysis & background r
 | 🎞️ **GIF 动画支持**：多帧提取、保留原始帧时长、动画预览轮播 | **Animated GIF support**: multi-frame extraction, original frame durations kept, live preview loop |
 | 🔄 **自动替换**：上传新图片自动生成新光标并替换系统光标 + 弹窗提示 | **Auto-swap**: a new upload auto-generates and replaces the cursor, with a popup notice |
 | 🎯 点击预览设置**热点**；↺/↻ **旋转 90°**；**光标大小** 48/64/96 可选 | Click-to-set **hotspot**; ↺/↻ **rotate 90°**; **cursor size** 48/64/96 selectable |
-| 🗂 **图库**：所有上传图片与生成光标存于程序目录 `data/`，可查看 / 应用 / 重命名 / 归类 / 删除 | **Gallery**: all uploads & cursors stored in `data/`, view / apply / rename / categorize / delete |
+| 🗂 **图库**：所有上传图片与生成光标存于 `C:\Program Files\custom-cursor-controller\data\`，可查看 / 应用 / 重命名 / 归类 / 删除 | **Gallery**: all uploads & cursors stored in `C:\Program Files\custom-cursor-controller\data\`, view / apply / rename / categorize / delete |
 | 🔍 **内容查重**（SHA-256）：重复上传相同内容时提示，可选择取消（自动清理） | **Content dedup** (SHA-256): duplicate uploads are flagged; cancel auto-cleans the new copies |
 | 🪳 经典蟑螂光标是项目的起源（现已演化为通用控制器） | The classic cockroach cursor is where the project started (now a general-purpose controller) |
 | 💾 备份原始光标，退出时自动恢复 | Backs up the original cursor and restores it on exit |
@@ -80,7 +80,7 @@ Run `dist\CustomCursorController.exe` — double-click to enter the GUI.
 7. **查重**：上传与已存图片/光标内容相同（SHA-256）时会提示，选择"确定"生成副本或"取消"（自动清理本次内容）。
 8. **退出**：关闭窗口最小化到托盘（光标保持生效）；托盘菜单或「退出」按钮退出并自动恢复系统光标。
 
-用户数据保存在程序目录 `data/`（uploads=上传原图+缩略图，cursors=光标快照 .ani/预览/帧 PNG，index.json=元数据索引）；程序目录不可写时自动回退到系统临时目录。
+用户数据默认保存在 `C:\Program Files\custom-cursor-controller\data\`（uploads=上传原图+缩略图，cursors=光标快照 .ani/预览/帧 PNG，index.json=元数据索引）；该位置不可写（如非管理员运行）时依次回退到程序目录 `data/`、系统临时目录。
 
 ---
 
@@ -119,7 +119,7 @@ custom-cursor-controller/
 │                          # 打包配置（内嵌前端）
 ├── requirements.txt       # pystray + Pillow + pywebview + pythonnet
 ├── data/                  # User data (created at runtime): uploads/ + cursors/ + index.json
-│                          # 用户数据（运行时创建）：上传图片与生成的光标
+│                          # 用户数据（运行时创建，默认位于 C:\Program Files\custom-cursor-controller\data\）
 └── dist/                  # Build output: CustomCursorController.exe
                            # 打包产物
 ```

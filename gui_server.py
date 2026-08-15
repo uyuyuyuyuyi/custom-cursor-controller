@@ -61,17 +61,18 @@ def _sanitize_name(name: str, fallback: str = "未命名") -> str:
 
 
 class CursorStore:
-    """数据存储: data/ 目录（程序目录内部）保存上传原图与生成的光标。
+    """数据存储: 保存上传原图与生成的光标。
 
+    主位置: C:\\Program Files\\custom-cursor-controller\\data（跨目录固定）。
     结构:
-      data/index.json              元数据索引
-      data/uploads/<uid><ext>      上传的原始文件
-      data/uploads/<uid>_thumb.png 缩略图
-      data/cursors/<cid>/ani       生成的 .ani 光标
-      data/cursors/<cid>/preview.png   首帧预览
-      data/cursors/<cid>/frame_N.png   每帧 PNG（用于恢复工作状态）
+      <root>/index.json              元数据索引
+      <root>/uploads/<uid><ext>      上传的原始文件
+      <root>/uploads/<uid>_thumb.png 缩略图
+      <root>/cursors/<cid>/ani       生成的 .ani 光标
+      <root>/cursors/<cid>/preview.png   首帧预览
+      <root>/cursors/<cid>/frame_N.png   每帧 PNG（用于恢复工作状态）
 
-    程序目录不可写（如装在只读位置）时自动回退到系统临时目录。
+    主位置不可写（如非管理员运行）时依次回退到程序目录 data/、系统临时目录。
     """
 
     def __init__(self, root: str | None = None):
@@ -85,20 +86,31 @@ class CursorStore:
         self._load()
 
     def _resolve_root(self) -> str:
+        """数据目录主位置: C:\\Program Files\\custom-cursor-controller\\data。
+
+        优先使用固定位置（可迁移、不受程序所在目录影响）；不可写时依次回退到
+        程序目录下的 data/、系统临时目录（非管理员运行 exe 时 Program Files 通常不可写）。
+        """
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                         "custom-cursor-controller", "data"),
+        ]
         base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
                 else os.path.dirname(os.path.abspath(__file__)))
-        primary = os.path.join(base, "data")
-        try:
-            os.makedirs(primary, exist_ok=True)
-            probe = os.path.join(primary, ".probe")
-            with open(probe, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(probe)
-            return primary
-        except OSError:
-            fallback = os.path.join(tempfile.gettempdir(), "custom_cursor_data")
-            os.makedirs(fallback, exist_ok=True)
-            return fallback
+        candidates.append(os.path.join(base, "data"))
+        candidates.append(os.path.join(tempfile.gettempdir(), "custom_cursor_data"))
+        last_err: OSError | None = None
+        for c in candidates:
+            try:
+                os.makedirs(c, exist_ok=True)
+                probe = os.path.join(c, ".probe")
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("ok")
+                os.remove(probe)
+                return c
+            except OSError as e:
+                last_err = e
+        raise OSError(f"无法创建数据目录: {last_err}")
 
     def _load(self) -> None:
         try:
