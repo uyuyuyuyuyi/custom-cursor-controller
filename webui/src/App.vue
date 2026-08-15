@@ -144,19 +144,23 @@ async function toggle() {
   }
 }
 
-// ── 水平翻转 ──────────────────────────────────────────
-async function flipH() {
+// ── 旋转 90° ──────────────────────────────────────────
+async function rotate(dir) {
   if (!state.frames) return
   busy.value = true
   error.value = ''
   try {
-    const r = await api('/api/flip', { method: 'POST' })
+    const r = await api('/api/rotate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ direction: dir }),
+    })
     state.previews = r.previews
     state.hotspot = r.hotspot
     state.enabled = r.enabled
     animIndex.value = 0
   } catch (e) {
-    error.value = `翻转失败: ${e.message}`
+    error.value = `旋转失败: ${e.message}`
   } finally { busy.value = false }
 }
 
@@ -257,7 +261,8 @@ function quitApp() {
           <span class="tag accent">热点 ({{ state.hotspot[0] }}, {{ state.hotspot[1] }})</span>
         </div>
         <div class="preview-actions">
-          <button class="btn small" :disabled="!state.frames || busy" @click="flipH">⇄ 水平翻转</button>
+          <button class="btn small" :disabled="!state.frames || busy" @click="rotate('ccw')">↺ 逆时针 90°</button>
+          <button class="btn small" :disabled="!state.frames || busy" @click="rotate('cw')">↻ 顺时针 90°</button>
         </div>
       </section>
 

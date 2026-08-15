@@ -132,13 +132,24 @@ class CursorApp:
                        + base64.b64encode(buf.getvalue()).decode())
         return out
 
-    def flip_horizontal(self) -> dict:
-        """水平翻转所有暂存帧；热点同步镜像；启用中则立即重新生效。"""
+    def rotate(self, direction: str) -> dict:
+        """将所有暂存帧旋转 90°；热点同步变换；启用中立即重新生效。
+
+        Args:
+            direction: "ccw"=逆时针 90° / "cw"=顺时针 90°
+        """
         with self.lock:
             if not self.frames:
                 raise ValueError("还没有可用图片，请先上传")
-            self.frames = [f.transpose(Image.FLIP_LEFT_RIGHT) for f in self.frames]
-            self.hotspot = (CANVAS_SIZE - 1 - self.hotspot[0], self.hotspot[1])
+            hx, hy = self.hotspot
+            if direction == "ccw":
+                self.frames = [f.transpose(Image.Transpose.ROTATE_90) for f in self.frames]
+                self.hotspot = (CANVAS_SIZE - 1 - hy, hx)
+            elif direction == "cw":
+                self.frames = [f.transpose(Image.Transpose.ROTATE_270) for f in self.frames]
+                self.hotspot = (hy, CANVAS_SIZE - 1 - hx)
+            else:
+                raise ValueError("direction 必须是 'ccw' 或 'cw'")
             if self.enabled:
                 self.mgr.replace_with_cockroach(self._rebuild_ani())
             return {
@@ -285,8 +296,10 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     data = json.loads(self.rfile.read(length) or b"{}")
                     enabled = app.set_hotspot(int(data.get("x", 24)), int(data.get("y", 24)))
                     self._send_json({"enabled": enabled})
-                elif path == "/api/flip":
-                    self._send_json(app.flip_horizontal())
+                elif path == "/api/rotate":
+                    length = int(self.headers.get("Content-Length", 0))
+                    data = json.loads(self.rfile.read(length) or b"{}")
+                    self._send_json(app.rotate(str(data.get("direction", ""))))
                 elif path == "/api/quit":
                     self._send_json({"bye": True})
                     threading.Thread(target=quit_callback, daemon=True).start()

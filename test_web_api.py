@@ -99,29 +99,49 @@ def main():
     _, rs = req("POST", url + "/api/restore")
     check("restore 后 enabled=False", rs["enabled"] is False)
 
-    # 5b. 水平翻转（左箭头 → 右箭头）
+    # 5b. 旋转 90°（左箭头: 尖在左 x=6..18，尾 x=18..42）
     _, up2 = upload(url, [make_left_arrow()])
     check("上传左箭头", up2["frames"] == 1)
-    left_tip = preview_pixel(up2["previews"], 0, 8, 24)   # 翻转前: 尖在左
-    check("翻转前左侧是箭头", left_tip[3] > 200, str(left_tip))
-    check("翻转前最右侧是空白", preview_pixel(up2["previews"], 0, 45, 24)[3] < 50)
 
     _, hs2 = req("POST", url + "/api/hotspot",
                  json.dumps({"x": 10, "y": 20}).encode(),
                  {"Content-Type": "application/json"})
     check("手动设置热点 (10,20)", hs2["enabled"] is False)
 
-    _, fl = req("POST", url + "/api/flip")
-    check("翻转后热点镜像为 (37,20)", fl["hotspot"] == [37, 20], str(fl["hotspot"]))
-    check("翻转后右侧是箭头", preview_pixel(fl["previews"], 0, 40, 24)[3] > 200)
-    check("翻转后最左侧是空白", preview_pixel(fl["previews"], 0, 2, 24)[3] < 50)
+    # 逆时针: (x,y)→(47-y,x); 尖(6,24)→(23,6)，附近 (23,8) 应为白色
+    _, ccw = req("POST", url + "/api/rotate",
+                 json.dumps({"direction": "ccw"}).encode(),
+                 {"Content-Type": "application/json"})
+    check("逆时针后热点 (27,10)", ccw["hotspot"] == [27, 10], str(ccw["hotspot"]))
+    check("逆时针后上方是箭头", preview_pixel(ccw["previews"], 0, 23, 8)[3] > 200)
+    check("逆时针后下方是空白", preview_pixel(ccw["previews"], 0, 23, 45)[3] < 50)
 
-    # 5c. 启用状态下翻转仍生效
+    # 顺时针转回: 热点应回到 (10,20)，方向复原
+    _, cw = req("POST", url + "/api/rotate",
+                json.dumps({"direction": "cw"}).encode(),
+                {"Content-Type": "application/json"})
+    check("顺时针转回后热点 (10,20)", cw["hotspot"] == [10, 20], str(cw["hotspot"]))
+    check("转回后左侧是箭头", preview_pixel(cw["previews"], 0, 8, 24)[3] > 200)
+
+    # 启用状态下顺时针旋转仍生效: (10,20)→(20,37); 尖(6,24)→(24,39)
     req("POST", url + "/api/apply")
-    _, fl2 = req("POST", url + "/api/flip")
-    check("启用中翻转后 enabled=True", fl2["enabled"] is True)
-    check("再次翻转热点回到 (10,20)", fl2["hotspot"] == [10, 20], str(fl2["hotspot"]))
+    _, cw2 = req("POST", url + "/api/rotate",
+                 json.dumps({"direction": "cw"}).encode(),
+                 {"Content-Type": "application/json"})
+    check("启用中顺时针后 enabled=True", cw2["enabled"] is True)
+    check("顺时针后热点 (20,37)", cw2["hotspot"] == [20, 37], str(cw2["hotspot"]))
+    check("顺时针后下方是箭头", preview_pixel(cw2["previews"], 0, 24, 39)[3] > 200)
+    check("顺时针后上方是空白", preview_pixel(cw2["previews"], 0, 24, 2)[3] < 50)
     req("POST", url + "/api/restore")
+
+    # 非法方向 → 400
+    try:
+        req("POST", url + "/api/rotate",
+            json.dumps({"direction": "diagonal"}).encode(),
+            {"Content-Type": "application/json"})
+        check("非法方向被拒绝", False)
+    except urllib.error.HTTPError as e:
+        check("非法方向被拒绝 (400)", e.code == 400)
 
     # 6. 空白图 → 硬拒绝
     _, bad = upload(url, [make_blank()])
