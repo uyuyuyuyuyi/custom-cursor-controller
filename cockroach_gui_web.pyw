@@ -188,6 +188,37 @@ def main() -> None:
             # 页面加载完成后 5 秒再探测（确保前端已拉取状态并完成绘制）
             threading.Timer(5.0, probe).start()
 
+            # 第二阶段: 点击"光标大小=48"按钮，验证尺寸切换真正生效
+            click_js = """(function(){
+                var btns = document.querySelectorAll('.size-btn');
+                if (!btns.length) return 'NO_SIZE_BTN';
+                btns[0].click();
+                return 'CLICKED';
+            })()"""
+
+            def click_probe():
+                try:
+                    r1 = window.evaluate_js(click_js)
+                    print("SIZE_CLICK:", r1, flush=True)
+                except Exception as e:
+                    print("SIZE_CLICK_ERROR:", e, flush=True)
+
+                import json as _json
+                import urllib.request as _ur
+
+                def fetch_state():
+                    try:
+                        with _ur.urlopen(url + "/api/state", timeout=10) as resp:
+                            st = _json.loads(resp.read().decode("utf-8"))
+                        print("STATE_AFTER_CLICK: canvas_size=%s frames=%s" % (
+                            st.get("canvas_size"), st.get("frames")), flush=True)
+                    except Exception as e:
+                        print("STATE_AFTER_CLICK_ERROR:", e, flush=True)
+
+                threading.Timer(2.0, fetch_state).start()
+
+            threading.Timer(8.0, click_probe).start()
+
         if smoke:
             print("SMOKE_STARTED", flush=True)
             # demo 模式给截图/探针留时间

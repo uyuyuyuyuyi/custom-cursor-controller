@@ -26,7 +26,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass, field
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 # 光标画布尺寸（与 cursor_drawer / make_custom_cursor 保持一致）
 TARGET_SIZE = 48
@@ -72,7 +72,28 @@ def _pixels(img: Image.Image) -> list:
 
 # ── 背景去除 ──────────────────────────────────────────
 
-def auto_remove_background(img: Image.Image, tolerance: int = 42) -> tuple[Image.Image, bool]:
+def estimate_background_color(img: Image.Image, work_size: int = BG_WORK_SIZE) -> tuple[int, int, int]:
+    """估计图片边框主色（背景色），供多帧统一抠图使用。"""
+    small = img.convert("RGB").resize((work_size, work_size), Image.LANCZOS)
+    w, h = small.size
+    px = small.load()
+    border = []
+    for x in range(w):
+        border.append(px[x, 0])
+        border.append(px[x, h - 1])
+    for y in range(h):
+        border.append(px[0, y])
+        border.append(px[w - 1, y])
+    return tuple(sorted(border, key=lambda c: sum(c))[len(border) // 2])
+
+
+def auto_remove_background(
+    img: Image.Image,
+    tolerance: int = 42,
+    keep_existing_alpha: bool = False,
+    bg_hint: tuple[int, int, int] | None = None,
+    allow_mostly_background: bool = False,
+) -> tuple[Image.Image, bool]:
     """
     对没有透明通道的图片，自动去除纯色背景。
 
@@ -82,6 +103,10 @@ def auto_remove_background(img: Image.Image, tolerance: int = 42) -> tuple[Image
     Args:
         img: RGBA 或 RGB 图像
         tolerance: 颜色容差（欧氏距离上限）
+        keep_existing_alpha: True 时即使图片已有透明通道也执行抠背景，
+            最终 alpha = min(原 alpha, 抠图掩码)。
+            用于动画文件（如 GIF）中部分帧透明、部分帧纯色背景的情况，
+            保证所有帧背景一致，避免播放时闪现背景色块。
 
     Returns:
         (处理后的 RGBA 图像, 是否成功)
@@ -90,9 +115,10 @@ def auto_remove_background(img: Image.Image, tolerance: int = 42) -> tuple[Image
     if img.mode != "RGBA":
         img = img.convert("RGBA")
 
-    # 已经自带有效透明通道 → 无需处理
-    alpha = img.getchannel("A")
-    if alpha.getextrema()[0] < 250:
+    # 已自带有效透明通道且无需强制 → 直接返回
+    orig_alpha = img.getchannel("A")
+    had_alpha = orig_alpha.getextrema()[0] < 250
+    if had_alpha and not keep_existing_alpha:
         return img, True
 
     # 缩到工作尺寸提速
@@ -100,17 +126,11 @@ def auto_remove_background(img: Image.Image, tolerance: int = 42) -> tuple[Image
     w, h = small.size
     px = small.load()
 
-    # 边框像素集合
-    border = []
-    for x in range(w):
-        border.append(px[x, 0])
-        border.append(px[x, h - 1])
-    for y in range(h):
-        border.append(px[0, y])
-        border.append(px[w - 1, y])
-
-    # 中位色 = 背景色估计
-    bg = tuple(sorted(border, key=lambda c: sum(c))[len(border) // 2])
+    # 背景色: 优先使用调用方给的基准色（多帧动画共用），否则取边框主色
+    if bg_hint is not None:
+        bg = tuple(bg_hint)
+    else:
+        bg = estimate_background_color(img)
 
     def near(c1: tuple, c2: tuple, tol: int) -> bool:
         return (c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2 + (c1[2] - c2[2]) ** 2 <= tol * tol
@@ -142,11 +162,14 @@ def auto_remove_background(img: Image.Image, tolerance: int = 42) -> tuple[Image
     removed = sum(1 for row in visited for v in row if v)
     ratio = removed / (w * h)
 
-    # 成功判据: 去除了一部分（>1.5%）但不是几乎全部（背景与图案颜色相同）
-    if not (0.015 <= ratio <= 0.93):
+    # 成功判据: 去除了一部分（>1.5%）；"几乎整帧都是背景" 仅在动画帧模式
+    # (allow_mostly_background) 下视为成功——此时整帧透明是正确的
+    if ratio < 0.015:
+        return img, False
+    if ratio > 0.93 and not allow_mostly_background:
         return img, False
 
-    # 把掩码放大回原尺寸，应用到 alpha
+    # 把掩码放大回原尺寸
     mask = Image.new("L", (w, h), 0)
     mask_px = mask.load()
     for y in range(h):
@@ -155,7 +178,11 @@ def auto_remove_background(img: Image.Image, tolerance: int = 42) -> tuple[Image
     mask = mask.resize(img.size, Image.LANCZOS)
 
     out = img.copy()
-    out.putalpha(mask)
+    if had_alpha and keep_existing_alpha:
+        # 保留原有透明区域: alpha = min(原 alpha, 抠图掩码)
+        out.putalpha(ImageChops.darker(orig_alpha, mask))
+    else:
+        out.putalpha(mask)
     return out, True
 
 

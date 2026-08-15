@@ -2,7 +2,9 @@
 import base64
 import io
 import json
+import os
 import sys
+import tempfile
 import urllib.request
 
 from PIL import Image, ImageDraw
@@ -78,10 +80,12 @@ def make_gif(duration_ms=200):
     return buf.getvalue()
 
 def main():
-    app = CursorApp()
+    store_root = tempfile.mkdtemp(prefix="cockroach_test_")
+    app = CursorApp(store_root=store_root)
     server = start_server(app)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     print(f"服务: {url}")
+    print(f"存储: {store_root}")
 
     # 1. 初始状态
     _, st = req("GET", url + "/api/state")
@@ -93,6 +97,57 @@ def main():
     check("上传成功 frames=2", up["frames"] == 2, f"verdict={up['verdict']} score={up['score']}")
     check("previews 有 2 张", len(up.get("previews", [])) == 2)
     check("hotspot 已给出", isinstance(up.get("hotspot"), list) and len(up["hotspot"]) == 2)
+    check("上传返回光标 id/名称", up.get("cursor_id") and up.get("cursor_name"),
+          f"name={up.get('cursor_name')}")
+    check("上传返回 upload_ids", len(up.get("upload_ids", [])) == 2)
+    check("data_dir 存在", os.path.isdir(up.get("data_dir", "nonexistent")))
+
+    # 2a. 图库: 条目已入库，文件已落盘
+    _, gal = req("GET", url + "/api/gallery")
+    check("图库有 2 个上传", len(gal["uploads"]) == 2, f"n={len(gal['uploads'])}")
+    check("图库有 1 个光标", len(gal["cursors"]) == 1, f"n={len(gal['cursors'])}")
+    cid = gal["cursors"][0]["id"]
+    uid0 = gal["uploads"][0]["id"]
+    up_entry = gal["uploads"][0]
+    with urllib.request.urlopen(url + f"/api/gallery/uploads/{uid0}/thumb", timeout=15) as r:
+        thumb = r.read()
+    check("上传缩略图可访问 (PNG)", thumb[:8] == b"\x89PNG\r\n\x1a\n")
+    with urllib.request.urlopen(url + f"/api/gallery/cursors/{cid}/preview", timeout=15) as r:
+        pv_img = r.read()
+    check("光标预览可访问 (PNG)", pv_img[:8] == b"\x89PNG\r\n\x1a\n")
+    original_file = os.path.join(store_root, up_entry["filename"])
+    check("上传原图文件已落盘", os.path.isfile(original_file))
+
+    # 2b. 重命名 / 归类
+    _, rn = req("POST", url + f"/api/gallery/cursors/{cid}/rename",
+                json.dumps({"name": "我的箭头"}).encode(),
+                {"Content-Type": "application/json"})
+    check("重命名光标", rn.get("name") == "我的箭头", str(rn.get("name")))
+    _, ct = req("POST", url + f"/api/gallery/cursors/{cid}/category",
+                json.dumps({"category": "常用"}).encode(),
+                {"Content-Type": "application/json"})
+    check("光标归类", ct.get("category") == "常用", str(ct.get("category")))
+    _, ct2 = req("POST", url + f"/api/gallery/uploads/{uid0}/category",
+                 json.dumps({"category": "素材"}).encode(),
+                 {"Content-Type": "application/json"})
+    check("图片归类", ct2.get("category") == "素材")
+
+    # 2c. 从图库应用光标（恢复工作状态 + 替换系统光标）
+    _, ga = req("POST", url + f"/api/gallery/cursors/{cid}/apply")
+    check("图库应用光标 enabled=True", ga["enabled"] is True)
+    check("图库应用恢复画布尺寸", ga["canvas_size"] == 64, str(ga["canvas_size"]))
+    check("图库应用恢复帧数", ga["frames"] == 2, str(ga["frames"]))
+    req("POST", url + "/api/restore")
+
+    # 2d. 删除
+    _, dl = req("POST", url + f"/api/gallery/cursors/{cid}/delete")
+    check("删除光标", dl.get("deleted") is True)
+    _, gal2 = req("GET", url + "/api/gallery")
+    check("删除后图库光标为 0", len(gal2["cursors"]) == 0)
+    check("删除后上传仍保留", len(gal2["uploads"]) == 2)
+    req("POST", url + f"/api/gallery/uploads/{uid0}/delete")
+    _, gal3 = req("GET", url + "/api/gallery")
+    check("删除后上传为 1", len(gal3["uploads"]) == 1)
 
     # 2b. /api/previews 可恢复读取
     _, pv = req("GET", url + "/api/previews")
@@ -190,7 +245,7 @@ def main():
     check("GIF 提取 2 帧", gif_up["frames"] == 2, f"frames={gif_up['frames']}")
     check("GIF 预览 2 张", len(gif_up["previews"]) == 2)
     req("POST", url + "/api/apply")
-    import tempfile, os, struct as _struct
+    import struct as _struct
     ani_path = os.path.join(tempfile.gettempdir(), "cockroach_cursor_web", "custom.ani")
     with open(ani_path, "rb") as f:
         ani = f.read()
@@ -199,6 +254,30 @@ def main():
     jiffies = list(_struct.unpack_from("<" + "I" * (rate_size // 4), ani, rate_idx + 8))
     check("GIF 帧时长 200ms → jiffies=[12,12]", jiffies == [12, 12], str(jiffies))
     req("POST", url + "/api/restore")
+
+    # 5e. 真实 GIF（白底动画）: 所有帧背景统一透明（修复白底闪现）
+    gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "test_res", "cockroach-dancing.gif")
+    if os.path.exists(gif_path):
+        with open(gif_path, "rb") as f:
+            real_gif = f.read()
+        _, rg = upload(url, [real_gif])
+        check("真实 GIF 提取多帧", rg["frames"] > 1,
+              f"frames={rg['frames']} verdict={rg['verdict']} score={rg['score']}")
+        corners_ok = True
+        worst_corner = 255
+        for pv in rg["previews"]:
+            img = Image.open(io.BytesIO(base64.b64decode(pv.split(",", 1)[1]))).convert("RGBA")
+            for (cx, cy) in ((2, 2), (img.width - 3, 2),
+                             (2, img.height - 3), (img.width - 3, img.height - 3)):
+                a = img.getpixel((cx, cy))[3]
+                worst_corner = min(worst_corner, a)
+                if a > 120:
+                    corners_ok = False
+        check("GIF 所有帧四角透明（无白底闪现）", corners_ok,
+              f"worst_corner_alpha={worst_corner}")
+    else:
+        print("  (跳过真实 GIF 测试: test_res/cockroach-dancing.gif 不存在)")
 
     # 6. 空白图 → 硬拒绝
     _, bad = upload(url, [make_blank()])
