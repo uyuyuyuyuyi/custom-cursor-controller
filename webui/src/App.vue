@@ -23,7 +23,7 @@ const uploading = ref(false)
 const busy = ref(false)
 const error = ref('')
 const dragging = ref(false)
-const confirm = reactive({ show: false, title: '', body: [], action: null })
+const confirm = reactive({ show: false, title: '', body: [], action: null, cancelAction: null })
 
 // 弹窗提示（Toast）
 const toast = reactive({ show: false, text: '', kind: 'ok' })
@@ -137,18 +137,46 @@ async function doUpload(fileList) {
       showToast(`已自动替换为新光标「${r.cursor_name}」`)
     }
 
-    if (r.verdict === '不适合') {
-      confirm.title = '图片不适合做光标'
-      confirm.body = r.issues.map(i => `• ${i.message}`)
-      confirm.action = r.hard_reject ? null : applyAndNotify
-      confirm.show = true
-    } else if (r.verdict === '有风险') {
-      confirm.title = '图片可能不适合'
-      confirm.body = r.issues.map(i => `• ${i.message}`)
-      confirm.action = applyAndNotify
+    const verdictFlow = () => {
+      if (r.verdict === '不适合') {
+        confirm.title = '图片不适合做光标'
+        confirm.body = r.issues.map(i => `• ${i.message}`)
+        confirm.action = r.hard_reject ? null : applyAndNotify
+        confirm.cancelAction = null
+        confirm.show = true
+      } else if (r.verdict === '有风险') {
+        confirm.title = '图片可能不适合'
+        confirm.body = r.issues.map(i => `• ${i.message}`)
+        confirm.action = applyAndNotify
+        confirm.cancelAction = null
+        confirm.show = true
+      } else {
+        applyAndNotify()
+      }
+    }
+
+    // 查重: 相同内容（SHA-256）的图片/光标已存在 → 提示并让用户选择
+    const dups = r.duplicates || {}
+    const dupItems = [
+      ...(dups.uploads || []).map(u => `图片「${u.original}」已存在（相同内容）`),
+      ...(dups.cursors || []).map(c => `光标「${c.name}」已存在（相同内容）`),
+    ]
+    if (dupItems.length) {
+      confirm.title = '检测到重复内容'
+      confirm.body = [...dupItems, '仍然生成并保存新的副本吗？']
+      confirm.action = verdictFlow
+      confirm.cancelAction = async () => {
+        // 取消: 删除本次刚保存的条目
+        try { await api(`/api/gallery/cursors/${r.cursor_id}/delete`, { method: 'POST' }) } catch { /* ignore */ }
+        for (const uid of (r.upload_ids || [])) {
+          try { await api(`/api/gallery/uploads/${uid}/delete`, { method: 'POST' }) } catch { /* ignore */ }
+        }
+        await refreshGallery()
+        showToast('已取消，未保存重复内容')
+      }
       confirm.show = true
     } else {
-      await applyAndNotify()
+      verdictFlow()
     }
   } catch (e) {
     error.value = `上传失败: ${e.message}`
@@ -367,6 +395,7 @@ async function saveEdit() {
 function delItem(kind, item) {
   confirm.title = kind === 'cursors' ? `删除光标「${item.name}」？` : `删除图片「${item.original}」？`
   confirm.body = ['删除后不可恢复。']
+  confirm.cancelAction = null
   confirm.action = async () => {
     try {
       await api(`/api/gallery/${kind}/${item.id}/delete`, { method: 'POST' })
@@ -541,7 +570,7 @@ function quitApp() {
           <li v-for="(t, i) in confirm.body" :key="i"><span class="lvl">提示</span>{{ t }}</li>
         </ul>
         <div class="modal-actions">
-          <button class="btn" @click="confirm.show = false">取消</button>
+          <button class="btn" @click="confirm.cancelAction ? (confirm.cancelAction(), confirm.show = false) : (confirm.show = false)">取消</button>
           <button v-if="confirm.action" class="btn primary" @click="confirm.action(); confirm.show = false">确定</button>
         </div>
       </div>

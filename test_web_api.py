@@ -102,6 +102,10 @@ def main():
     check("上传返回 upload_ids", len(up.get("upload_ids", [])) == 2)
     check("data_dir 存在", os.path.isdir(up.get("data_dir", "nonexistent")))
 
+    # 2b. /api/previews 可恢复读取（紧跟上传，工作帧未变）
+    _, pv = req("GET", url + "/api/previews")
+    check("previews 接口返回 2 张", len(pv.get("previews", [])) == 2)
+
     # 2a. 图库: 条目已入库，文件已落盘
     _, gal = req("GET", url + "/api/gallery")
     check("图库有 2 个上传", len(gal["uploads"]) == 2, f"n={len(gal['uploads'])}")
@@ -149,9 +153,36 @@ def main():
     _, gal3 = req("GET", url + "/api/gallery")
     check("删除后上传为 1", len(gal3["uploads"]) == 1)
 
-    # 2b. /api/previews 可恢复读取
-    _, pv = req("GET", url + "/api/previews")
-    check("previews 接口返回 2 张", len(pv.get("previews", [])) == 2)
+    # 2e. 查重（SHA-256 内容哈希）
+    arrow_bytes = io.BytesIO()
+    make_arrow().save(arrow_bytes, format="PNG")
+    payload = arrow_bytes.getvalue()
+
+    _, up_d1 = upload(url, [payload])
+    check("首次上传无重复提示", len(up_d1["duplicates"]["uploads"]) == 0
+          and len(up_d1["duplicates"]["cursors"]) == 0)
+
+    _, up_d2 = upload(url, [payload])
+    check("重复上传命中已有图片", len(up_d2["duplicates"]["uploads"]) == 1)
+    check("重复上传命中已有光标", len(up_d2["duplicates"]["cursors"]) == 1)
+
+    _, up_d1b = upload(url, [payload, payload])
+    check("同请求双份相同文件 → 图片重复命中", len(up_d1b["duplicates"]["uploads"]) == 1)
+    check("同请求双份相同文件 frames=2", up_d1b["frames"] == 2)
+
+    other = io.BytesIO()
+    make_arrow((10, 200, 60, 255)).save(other, format="PNG")
+    _, up_d3 = upload(url, [other.getvalue()])
+    check("同名不同内容不误报", len(up_d3["duplicates"]["uploads"]) == 0
+          and len(up_d3["duplicates"]["cursors"]) == 0)
+
+    # 取消重复流程: 删除本次新生成的条目
+    cid_new = up_d2["cursor_id"]
+    req("POST", url + f"/api/gallery/cursors/{cid_new}/delete")
+    for uid in up_d2["upload_ids"]:
+        req("POST", url + f"/api/gallery/uploads/{uid}/delete")
+    _, gal_clean = req("GET", url + "/api/gallery")
+    check("取消后新条目已清理", all(c["id"] != cid_new for c in gal_clean["cursors"]))
 
     # 3. 启用（真实替换系统光标！）
     _, ap = req("POST", url + "/api/apply")

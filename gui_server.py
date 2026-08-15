@@ -19,6 +19,7 @@ API:
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -137,10 +138,20 @@ class CursorStore:
             "size": meta.get("size", [0, 0]),
             "verdict": meta.get("verdict", ""),
             "score": meta.get("score", 0),
+            "sha256": meta.get("sha256", ""),
         }
         self.index["uploads"][uid] = entry
         self._save()
         return entry
+
+    def find_upload_by_sha(self, sha256: str) -> dict | None:
+        """按内容哈希查找已存在的上传（查重）。"""
+        if not sha256:
+            return None
+        for e in self.index["uploads"].values():
+            if e.get("sha256") == sha256:
+                return e
+        return None
 
     # ── 光标 ──────────────────────────────────────────
     def add_cursor(self, ani_bytes: bytes, preview_png: bytes,
@@ -166,10 +177,21 @@ class CursorStore:
             "frames": meta.get("frames", 1),
             "animated": meta.get("animated", False),
             "upload_ids": meta.get("upload_ids", []),
+            "source_hashes": sorted(meta.get("source_hashes", [])),
         }
         self.index["cursors"][cid] = entry
         self._save()
         return entry
+
+    def find_cursor_by_sources(self, source_hashes: list[str]) -> dict | None:
+        """按来源内容哈希集合查找已存在的光标（查重）。"""
+        target = sorted(source_hashes)
+        if not target:
+            return None
+        for e in self.index["cursors"].values():
+            if sorted(e.get("source_hashes", [])) == target:
+                return e
+        return None
 
     def cursor_ani_path(self, cid: str) -> str | None:
         entry = self.index["cursors"].get(cid)
@@ -342,7 +364,14 @@ class CursorApp:
         # ── 存储: 上传原图 + 生成的光标快照 ──
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         upload_ids = []
+        file_shas: list[str] = []
+        dup_uploads: dict[str, dict] = {}
         for fi in file_info:
+            sha = hashlib.sha256(fi["data"]).hexdigest()[:16]
+            file_shas.append(sha)
+            dup = self.store.find_upload_by_sha(sha)
+            if dup:
+                dup_uploads[dup["id"]] = dup
             # 该文件的综合结论（取其帧中最低分）
             f_verdicts = verdicts[fi["start"]: fi["start"] + fi["count"]]
             f_worst = min(f_verdicts, key=lambda a: a.score) if f_verdicts else worst
@@ -352,7 +381,8 @@ class CursorApp:
             entry = self.store.add_upload(
                 fi["name"], fi["data"], thumb,
                 {"created": now, "size": fi["size"],
-                 "verdict": f_worst.verdict, "score": f_worst.score},
+                 "verdict": f_worst.verdict, "score": f_worst.score,
+                 "sha256": sha},
             )
             upload_ids.append(entry["id"])
 
@@ -375,11 +405,13 @@ class CursorApp:
             b = io.BytesIO()
             f.save(b, format="PNG")
             frames_png.append(b.getvalue())
+        dup_cursor = self.store.find_cursor_by_sources(file_shas)
         c_entry = self.store.add_cursor(
             ani_bytes, preview_buf.getvalue(), frames_png,
             {"name": cursor_name, "created": now, "size": self.canvas_size,
              "hotspot": list(self.hotspot), "frames": len(frames),
-             "animated": len(frames) > 1, "upload_ids": upload_ids},
+             "animated": len(frames) > 1, "upload_ids": upload_ids,
+             "source_hashes": file_shas},
         )
         with self.lock:
             self.last_cursor_id = c_entry["id"]
@@ -405,6 +437,12 @@ class CursorApp:
             "cursor_name": c_entry["name"],
             "upload_ids": upload_ids,
             "data_dir": self.store.root,
+            "duplicates": {
+                "uploads": [{"id": e["id"], "original": e["original"]}
+                            for e in dup_uploads.values()],
+                "cursors": ([{"id": dup_cursor["id"], "name": dup_cursor["name"]}]
+                            if dup_cursor else []),
+            },
         }
 
     @staticmethod
