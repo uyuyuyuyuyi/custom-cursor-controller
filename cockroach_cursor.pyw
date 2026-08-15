@@ -34,6 +34,12 @@ RESOURCES_DIR = os.path.join(BASE_DIR, "resources")
 ANI_PATH = os.path.join(RESOURCES_DIR, "cockroach.ani")
 TRAY_ICON_PATH = os.path.join(RESOURCES_DIR, "tray_icon.png")
 
+# PyInstaller 打包时资源内嵌在 _MEIPASS 中（onefile=临时解压目录, onedir=_internal）
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    BUNDLED_RESOURCES_DIR = os.path.join(sys._MEIPASS, "resources")
+else:
+    BUNDLED_RESOURCES_DIR = None
+
 # ── Windows API 常量 ───────────────────────────────────
 OCR_NORMAL = 32512          # 普通箭头光标
 IMAGE_CURSOR = 2
@@ -100,21 +106,32 @@ class CursorManager:
         self._saved_original: int | None = None  # 原始箭头光标备份句柄
 
     def backup_original(self) -> None:
-        """备份当前系统箭头光标句柄（供后续恢复）。"""
+        """备份当前系统箭头光标句柄（供后续恢复）。
+
+        注意: 不能用 LR_COPYFROMRESOURCE —— 该标志要求 hImage 是资源句柄,
+        而 LoadCursorW 返回的是已加载的共享句柄, 两者不匹配会导致备份
+        句柄无效, 恢复时 SetSystemCursor 看似成功实则不生效。
+        """
         # 获取系统默认箭头的共享句柄
         h_shared = user32.LoadCursorW(None, _makeintresource(OCR_NORMAL))
         _check(h_shared, "LoadCursorW 失败")
 
-        # 复制一份独立句柄保存
-        h_copy = user32.CopyImage(h_shared, IMAGE_CURSOR, 0, 0, LR_COPYFROMRESOURCE)
+        # 复制一份独立句柄保存 (flags=0: 从已加载句柄复制)
+        h_copy = user32.CopyImage(h_shared, IMAGE_CURSOR, 0, 0, 0)
         _check(h_copy, "CopyImage 备份原始光标失败")
 
         self._saved_original = h_copy
 
-    def replace_with_cockroach(self) -> None:
-        """用蟑螂动画光标替换系统箭头。"""
-        h_new = user32.LoadCursorFromFileW(ANI_PATH)
-        _check(h_new, f"LoadCursorFromFileW 失败: {ANI_PATH}")
+    def replace_with_cockroach(self, ani_path: str | None = None) -> None:
+        """用动画光标替换系统箭头。
+
+        Args:
+            ani_path: 要加载的 .ani 文件路径；None 时使用模块默认路径
+                      （resources\\cockroach.ani 或 exe 内嵌资源）。
+        """
+        path = ani_path or ANI_PATH
+        h_new = user32.LoadCursorFromFileW(path)
+        _check(h_new, f"LoadCursorFromFileW 失败: {path}")
 
         ok = user32.SetSystemCursor(h_new, OCR_NORMAL)
         if not ok:
@@ -124,22 +141,39 @@ class CursorManager:
         # 成功：SetSystemCursor 已接管 h_new，无需手动销毁
 
     def restore_original(self) -> None:
-        """恢复原始系统箭头光标。"""
-        if self._saved_original is None:
-            return
+        """恢复原始系统箭头光标，并广播刷新所有窗口的光标方案。
 
-        # 从备份再 CopyImage 一份（SetSystemCursor 会销毁传入的句柄）
-        h_restore = user32.CopyImage(self._saved_original, IMAGE_CURSOR, 0, 0, 0)
-        _check(h_restore, "CopyImage 恢复光标失败")
+        Windows 上 SetSystemCursor 修改后，explorer 等窗口会缓存光标，
+        必须再发 SPI_SETCURSORS 广播 (SPIF_SENDCHANGE) 让所有窗口
+        从系统设置重新加载光标，否则用户看到的光标不会更新。
+        """
+        errors = []
 
-        ok = user32.SetSystemCursor(h_restore, OCR_NORMAL)
+        # 1) 立即恢复箭头 (SetSystemCursor 会销毁传入的句柄, 故从备份复制)
+        if self._saved_original is not None:
+            h_restore = user32.CopyImage(self._saved_original, IMAGE_CURSOR, 0, 0, 0)
+            if h_restore:
+                ok = user32.SetSystemCursor(h_restore, OCR_NORMAL)
+                if not ok:
+                    user32.DestroyCursor(h_restore)
+                    errors.append(f"SetSystemCursor 恢复光标失败 (err={kernel32.GetLastError()})")
+            else:
+                errors.append(f"CopyImage 恢复光标失败 (err={kernel32.GetLastError()})")
+
+        # 2) 广播刷新: 让所有窗口(含 explorer)从系统设置重新加载光标方案
+        ok = user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, SPIF_SENDCHANGE)
         if not ok:
-            user32.DestroyCursor(h_restore)
-            _check(False, "SetSystemCursor 恢复光标失败")
+            errors.append(f"SPI_SETCURSORS 广播失败 (err={kernel32.GetLastError()})")
+
+        if errors:
+            raise ctypes.WinError(kernel32.GetLastError(), "; ".join(errors))
 
     def reload_system_defaults(self) -> None:
         """通过 SPI_SETCURSORS 广播恢复所有系统光标默认值。"""
-        user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, SPIF_SENDCHANGE)
+        ok = user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, SPIF_SENDCHANGE)
+        if not ok:
+            raise ctypes.WinError(
+                kernel32.GetLastError(), "SPI_SETCURSORS 广播失败")
 
     def cleanup(self) -> None:
         """释放备份句柄。"""
@@ -155,7 +189,23 @@ _cursor_mgr = CursorManager()
 # ── 资源初始化 ────────────────────────────────────────
 
 def ensure_resources() -> None:
-    """确保 .ani 光标文件和托盘图标存在。"""
+    """确保 .ani 光标文件和托盘图标可用。
+
+    打包版 (PyInstaller) 优先使用内嵌在 exe 中的资源，不写盘、不生成
+    resources 文件夹；仅当无内嵌资源（源码直接运行时）才在磁盘上生成。
+    """
+    global ANI_PATH, TRAY_ICON_PATH
+
+    # 打包版：使用内嵌资源
+    if BUNDLED_RESOURCES_DIR is not None:
+        bundled_ani = os.path.join(BUNDLED_RESOURCES_DIR, "cockroach.ani")
+        bundled_icon = os.path.join(BUNDLED_RESOURCES_DIR, "tray_icon.png")
+        if os.path.exists(bundled_ani) and os.path.exists(bundled_icon):
+            ANI_PATH = bundled_ani
+            TRAY_ICON_PATH = bundled_icon
+            return
+
+    # 源码运行：生成到 exe/脚本所在目录的 resources 文件夹
     os.makedirs(RESOURCES_DIR, exist_ok=True)
 
     if not os.path.exists(ANI_PATH):
