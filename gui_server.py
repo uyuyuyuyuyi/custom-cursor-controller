@@ -120,14 +120,32 @@ class CursorApp:
     def previews(self) -> list[str]:
         """当前暂存帧的 base64 预览（每帧 4x 放大 PNG）。"""
         with self.lock:
-            out = []
-            for f in self.frames:
-                big = f.resize((CANVAS_SIZE * 4, CANVAS_SIZE * 4), Image.NEAREST)
-                buf = io.BytesIO()
-                big.save(buf, format="PNG")
-                out.append("data:image/png;base64,"
-                           + base64.b64encode(buf.getvalue()).decode())
-            return out
+            return self._previews_unlocked()
+
+    def _previews_unlocked(self) -> list[str]:
+        out = []
+        for f in self.frames:
+            big = f.resize((CANVAS_SIZE * 4, CANVAS_SIZE * 4), Image.NEAREST)
+            buf = io.BytesIO()
+            big.save(buf, format="PNG")
+            out.append("data:image/png;base64,"
+                       + base64.b64encode(buf.getvalue()).decode())
+        return out
+
+    def flip_horizontal(self) -> dict:
+        """水平翻转所有暂存帧；热点同步镜像；启用中则立即重新生效。"""
+        with self.lock:
+            if not self.frames:
+                raise ValueError("还没有可用图片，请先上传")
+            self.frames = [f.transpose(Image.FLIP_LEFT_RIGHT) for f in self.frames]
+            self.hotspot = (CANVAS_SIZE - 1 - self.hotspot[0], self.hotspot[1])
+            if self.enabled:
+                self.mgr.replace_with_cockroach(self._rebuild_ani())
+            return {
+                "hotspot": list(self.hotspot),
+                "enabled": self.enabled,
+                "previews": self._previews_unlocked(),
+            }
 
     @staticmethod
     def _fit_to_canvas(img: Image.Image, size: int) -> Image.Image:
@@ -267,6 +285,8 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     data = json.loads(self.rfile.read(length) or b"{}")
                     enabled = app.set_hotspot(int(data.get("x", 24)), int(data.get("y", 24)))
                     self._send_json({"enabled": enabled})
+                elif path == "/api/flip":
+                    self._send_json(app.flip_horizontal())
                 elif path == "/api/quit":
                     self._send_json({"bye": True})
                     threading.Thread(target=quit_callback, daemon=True).start()

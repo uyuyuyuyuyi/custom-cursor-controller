@@ -73,6 +73,8 @@ body {
 }
 .preview-canvas.empty { background: #12161c; }
 .meta-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; justify-content: center; }
+.preview-actions { display: flex; justify-content: center; margin-top: 10px; }
+.btn.small { padding: 5px 14px; font-size: 12.5px; }
 .tag {
   font-size: 11px; padding: 3px 9px; border-radius: 999px;
   background: var(--bg-card2); border: 1px solid var(--border); color: var(--text-dim);

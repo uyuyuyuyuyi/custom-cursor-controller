@@ -144,6 +144,22 @@ async function toggle() {
   }
 }
 
+// ── 水平翻转 ──────────────────────────────────────────
+async function flipH() {
+  if (!state.frames) return
+  busy.value = true
+  error.value = ''
+  try {
+    const r = await api('/api/flip', { method: 'POST' })
+    state.previews = r.previews
+    state.hotspot = r.hotspot
+    state.enabled = r.enabled
+    animIndex.value = 0
+  } catch (e) {
+    error.value = `翻转失败: ${e.message}`
+  } finally { busy.value = false }
+}
+
 // ── 热点 ──────────────────────────────────────────────
 const CANVAS_SIZE = 48          // 光标画布逻辑尺寸（与服务端一致）
 const PREVIEW_SCALE = 4         // 预览放大倍率（画布实际 192×192）
@@ -239,6 +255,9 @@ function quitApp() {
           <span class="tag" v-else-if="state.frames === 1">静态光标</span>
           <span class="tag" v-if="state.srcSize">原图 {{ state.srcSize[0] }}×{{ state.srcSize[1] }}</span>
           <span class="tag accent">热点 ({{ state.hotspot[0] }}, {{ state.hotspot[1] }})</span>
+        </div>
+        <div class="preview-actions">
+          <button class="btn small" :disabled="!state.frames || busy" @click="flipH">⇄ 水平翻转</button>
         </div>
       </section>
 

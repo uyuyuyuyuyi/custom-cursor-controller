@@ -1,4 +1,5 @@
 """test_web_api.py — gui_server 端到端测试（会短暂替换系统光标，随即恢复）"""
+import base64
 import io
 import json
 import sys
@@ -47,6 +48,20 @@ def make_arrow(color=(255, 255, 255, 255)):
     d.polygon([(6, 40), (6, 14), (18, 14), (24, 4), (30, 14), (42, 14), (42, 40)], fill=color)
     return img
 
+def make_left_arrow():
+    """左箭头（不对称，用于验证水平翻转）。尖在左 x=6，尾 x=18..42。"""
+    img = Image.new("RGBA", (48, 48), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.polygon([(6, 24), (18, 10), (18, 20), (42, 20), (42, 28), (18, 28), (18, 38)],
+              fill=(255, 255, 255, 255))
+    return img
+
+def preview_pixel(previews, i, x, y):
+    """读取第 i 帧预览图在逻辑坐标 (x, y) 处的 RGBA（预览为 4 倍放大）。"""
+    b64 = previews[i].split(",", 1)[1]
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+    return img.getpixel((x * 4 + 2, y * 4 + 2))
+
 def make_blank():
     return Image.new("RGBA", (48, 48), (0, 0, 0, 0))
 
@@ -83,6 +98,30 @@ def main():
     # 5. 恢复
     _, rs = req("POST", url + "/api/restore")
     check("restore 后 enabled=False", rs["enabled"] is False)
+
+    # 5b. 水平翻转（左箭头 → 右箭头）
+    _, up2 = upload(url, [make_left_arrow()])
+    check("上传左箭头", up2["frames"] == 1)
+    left_tip = preview_pixel(up2["previews"], 0, 8, 24)   # 翻转前: 尖在左
+    check("翻转前左侧是箭头", left_tip[3] > 200, str(left_tip))
+    check("翻转前最右侧是空白", preview_pixel(up2["previews"], 0, 45, 24)[3] < 50)
+
+    _, hs2 = req("POST", url + "/api/hotspot",
+                 json.dumps({"x": 10, "y": 20}).encode(),
+                 {"Content-Type": "application/json"})
+    check("手动设置热点 (10,20)", hs2["enabled"] is False)
+
+    _, fl = req("POST", url + "/api/flip")
+    check("翻转后热点镜像为 (37,20)", fl["hotspot"] == [37, 20], str(fl["hotspot"]))
+    check("翻转后右侧是箭头", preview_pixel(fl["previews"], 0, 40, 24)[3] > 200)
+    check("翻转后最左侧是空白", preview_pixel(fl["previews"], 0, 2, 24)[3] < 50)
+
+    # 5c. 启用状态下翻转仍生效
+    req("POST", url + "/api/apply")
+    _, fl2 = req("POST", url + "/api/flip")
+    check("启用中翻转后 enabled=True", fl2["enabled"] is True)
+    check("再次翻转热点回到 (10,20)", fl2["hotspot"] == [10, 20], str(fl2["hotspot"]))
+    req("POST", url + "/api/restore")
 
     # 6. 空白图 → 硬拒绝
     _, bad = upload(url, [make_blank()])
