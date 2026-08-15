@@ -219,6 +219,49 @@ def main() -> None:
 
             threading.Timer(8.0, click_probe).start()
 
+            # 第三阶段: 图库→控制台切换后，画布必须自动重绘（修复画布丢失）
+            def tab_probe():
+                try:
+                    r = window.evaluate_js("""(function(){
+                        var tabs = document.querySelectorAll('.tab');
+                        if (tabs.length < 2) return 'NO_TABS';
+                        tabs[1].click();
+                        return 'TO_GALLERY';
+                    })()""")
+                    print("TAB_TO_GALLERY:", r, flush=True)
+                except Exception as e:
+                    print("TAB_TO_GALLERY_ERROR:", e, flush=True)
+
+                def back_and_check():
+                    try:
+                        window.evaluate_js("""(function(){
+                            var tabs = document.querySelectorAll('.tab');
+                            tabs[0].click();
+                            return 'BACK';
+                        })()""")
+                    except Exception as e:
+                        print("TAB_BACK_ERROR:", e, flush=True)
+
+                    def check_pixels():
+                        js = """(function(){
+                            var c = document.querySelector('canvas');
+                            if (!c) return 'NO_CANVAS';
+                            var ctx = c.getContext('2d');
+                            var d = ctx.getImageData(160, 160, 1, 1).data;
+                            return JSON.stringify({w: c.width, h: c.height,
+                                                   far: [d[0], d[1], d[2], d[3]]});
+                        })()"""
+                        try:
+                            print("AFTER_TAB_BACK:", window.evaluate_js(js), flush=True)
+                        except Exception as e:
+                            print("AFTER_TAB_BACK_ERROR:", e, flush=True)
+
+                    threading.Timer(1.5, check_pixels).start()
+
+                threading.Timer(1.5, back_and_check).start()
+
+            threading.Timer(11.0, tab_probe).start()
+
         if smoke:
             print("SMOKE_STARTED", flush=True)
             # demo 模式给截图/探针留时间

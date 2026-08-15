@@ -123,7 +123,7 @@ body {
 /* ── 预览 ── */
 .preview-card { display: flex; flex-direction: column; }
 .preview-canvas {
-  margin: 0 auto; border-radius: 10px;
+  width: 256px; height: 256px; margin: 0 auto; border-radius: 10px;
   border: 1px solid var(--border); cursor: crosshair;
   box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
   max-width: 100%;

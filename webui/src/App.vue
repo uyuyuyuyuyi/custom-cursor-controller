@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 
 // ── 状态 ──────────────────────────────────────────────
 const state = reactive({
@@ -52,9 +52,8 @@ const previewCount = computed(() => state.previews.length)
 const currentPreview = computed(() =>
   state.previews.length ? state.previews[animIndex.value % state.previews.length] : null)
 
-// 预览画布像素尺寸（随光标大小自适应，最大约 256px）
-const previewScale = computed(() => Math.max(2, Math.floor(256 / (state.canvasSize || 64))))
-const previewPx = computed(() => (state.canvasSize || 64) * previewScale.value)
+// 预览画布固定显示尺寸（所有光标大小统一显示，避免尺寸跳变）
+const PREVIEW_PX = 256
 
 function startAnim() {
   stopAnim()
@@ -246,14 +245,14 @@ function onCanvasClick(e) {
     .catch(e => { error.value = `热点更新失败: ${e.message}` })
 }
 
-// 绘制预览画布（棋盘格 + 当前帧 + 热点十字，全部按画布真实尺寸）
+// 绘制预览画布（固定 256×256: 棋盘格 + 当前帧等比缩放 + 热点十字）
 function drawPreview() {
   const c = canvasRef.value
   if (!c) return
   const ctx = c.getContext('2d')
-  const CS = previewPx.value
+  const CS = PREVIEW_PX
   ctx.clearRect(0, 0, c.width, c.height)
-  const cell = 12
+  const cell = 16
   for (let y = 0; y < CS; y += cell)
     for (let x = 0; x < CS; x += cell) {
       ctx.fillStyle = ((x / cell + y / cell) % 2 === 0) ? '#e8e8e8' : '#ffffff'
@@ -273,19 +272,28 @@ function drawPreview() {
 }
 function drawHotspot(ctx, CS) {
   const [hx, hy] = state.hotspot
-  const s = previewScale.value
-  const px = hx * s
-  const py = hy * s
-  const half = 4 * s
+  const s = CS / (state.canvasSize || 64)   // 热点从画布坐标换算到预览坐标
+  const px = (hx + 0.5) * s
+  const py = (hy + 0.5) * s
+  const half = 6
   ctx.strokeStyle = '#ff3030'
-  ctx.lineWidth = 1.2
+  ctx.lineWidth = 1.4
   ctx.beginPath()
   ctx.moveTo(px - half, py); ctx.lineTo(px + half, py)
   ctx.moveTo(px, py - half); ctx.lineTo(px, py + half)
   ctx.stroke()
-  ctx.beginPath(); ctx.arc(px, py, 3 * s, 0, Math.PI * 2); ctx.stroke()
+  ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI * 2); ctx.stroke()
 }
-watch([currentPreview, () => state.hotspot.join(','), previewPx], drawPreview, { flush: 'post' })
+watch([currentPreview, () => state.hotspot.join(','), () => state.canvasSize],
+      drawPreview, { flush: 'post' })
+
+// 切回控制台时画布是重建的，必须强制重绘
+watch(tab, async (v) => {
+  if (v === 'console') {
+    await nextTick()
+    drawPreview()
+  }
+})
 
 // ── 图库 ──────────────────────────────────────────────
 async function refreshGallery() {
@@ -405,8 +413,7 @@ function quitApp() {
     <main v-if="tab === 'console'" class="layout">
       <section class="card preview-card">
         <h2>预览 <small>点击画面设置热点（点击点位置）</small></h2>
-        <canvas ref="canvasRef" :width="previewPx" :height="previewPx"
-                :style="{ width: previewPx + 'px', height: previewPx + 'px' }"
+        <canvas ref="canvasRef" width="256" height="256"
                 class="preview-canvas" @click="onCanvasClick"
                 :class="{ empty: !state.frames }"></canvas>
         <div class="size-row">
