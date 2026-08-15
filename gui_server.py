@@ -4,7 +4,7 @@ gui_server.py — 自定义光标控制器 Web 后端
 为 Vue 前端提供本地 HTTP API，复用项目现有的全部核心逻辑:
   - pointer_analyzer: 图片适合度分析 + 自动抠背景
   - ani_builder:      生成 .ani 光标文件
-  - cockroach_cursor:  Win32 光标替换 / 恢复（CursorManager）
+  - cursor_manager:  Win32 光标替换 / 恢复（CursorManager）
 
 API:
   GET  /api/state          当前状态 {enabled, frames, hotspot, verdict, ...}
@@ -34,7 +34,7 @@ from PIL import Image
 
 from ani_builder import build_ani_file, save_ani_file
 from pointer_analyzer import HARD_REJECT_CODES, analyze, auto_remove_background
-from cockroach_cursor import CursorManager
+from cursor_manager import CursorManager
 
 CANVAS_SIZE = 48            # 旧默认（兼容引用）
 DEFAULT_CANVAS_SIZE = 64    # 光标画布尺寸（可在界面选择 48/64/96）
@@ -96,7 +96,7 @@ class CursorStore:
             os.remove(probe)
             return primary
         except OSError:
-            fallback = os.path.join(tempfile.gettempdir(), "cockroach_cursor_data")
+            fallback = os.path.join(tempfile.gettempdir(), "custom_cursor_data")
             os.makedirs(fallback, exist_ok=True)
             return fallback
 
@@ -193,6 +193,23 @@ class CursorStore:
                 return e
         return None
 
+    def cursors_for_upload(self, uid: str, exclude: str | None = None) -> list[dict]:
+        """返回 upload_ids 包含 uid 的光标条目（exclude 可排除指定光标）。"""
+        return [e for e in self.index["cursors"].values()
+                if uid in e.get("upload_ids", []) and e.get("id") != exclude]
+
+    def uploads_for_cursor(self, cid: str) -> list[dict]:
+        """返回光标关联的、仍存在的上传图片条目。"""
+        entry = self.index["cursors"].get(cid)
+        if not entry:
+            return []
+        out = []
+        for uid in entry.get("upload_ids", []):
+            up = self.index["uploads"].get(uid)
+            if up:
+                out.append(up)
+        return out
+
     def cursor_ani_path(self, cid: str) -> str | None:
         entry = self.index["cursors"].get(cid)
         if not entry:
@@ -288,8 +305,17 @@ class CursorApp:
         self.last_cursor_id: str | None = None
 
     # ── 上传 → 分析 ────────────────────────────────────
-    def upload(self, file_items: list[tuple[str, bytes]]) -> dict:
-        import datetime
+    def _process_files(self, file_items: list[tuple[str, bytes]]):
+        """解析/抠背景/逐帧分析一组文件（upload 与图库"生成光标"共用）。
+
+        Returns:
+            (processed, durations, file_info, verdicts, worst)
+            processed: [(处理后的 RGBA 图, 抠背景是否成功)]
+            durations: 每帧时长 ms
+            file_info: 每个文件的元信息 {name, data, start, count, size}
+            verdicts:  每帧的分析结果
+            worst:     得分最低的分析结果
+        """
         processed: list[tuple[Image.Image, bool]] = []  # (处理后图, 抠背景是否成功)
         durations: list[int] = []
         file_info: list[dict] = []   # 每个文件: {name, data, frames 区间, 帧数}
@@ -345,6 +371,11 @@ class CursorApp:
             removal = None if has_alpha else bg_ok
             verdicts.append(analyze(img, removal_ok=removal))
         worst = min(verdicts, key=lambda a: a.score)
+        return processed, durations, file_info, verdicts, worst
+
+    def upload(self, file_items: list[tuple[str, bytes]]) -> dict:
+        import datetime
+        processed, durations, file_info, verdicts, worst = self._process_files(file_items)
 
         # 统一缩放到画布尺寸
         frames = []
@@ -477,6 +508,116 @@ class CursorApp:
             "hard_reject": hard_reject,
         }
 
+    def generate_from_upload(self, uid: str) -> dict:
+        """从图库中已保存的图片生成光标（复用上传分析流程，不重复入库图片）。
+
+        内容查重：相同内容的光标已存在时恢复其工作状态直接复用（existing=True）。
+        """
+        entry = self.store.get_upload(uid)
+        if not entry:
+            raise KeyError("图片不存在")
+        src_path = os.path.join(self.store.root, entry["filename"])
+        if not os.path.isfile(src_path):
+            raise ValueError("图片原始文件缺失")
+        with open(src_path, "rb") as f:
+            data = f.read()
+        sha = entry.get("sha256", "") or hashlib.sha256(data).hexdigest()[:16]
+
+        # 内容查重: 相同来源的光标已存在 → 直接复用
+        existing = self.store.find_cursor_by_sources([sha])
+        if existing:
+            frames = self.store.cursor_frames(existing["id"])
+            if not frames:
+                raise ValueError("已有光标文件缺失")
+            with self.lock:
+                self.frames = frames
+                self.canvas_size = existing["size"]
+                self.hotspot = tuple(existing["hotspot"])
+                self.durations = [FRAME_MS] * len(frames)
+                self.src_size = (frames[0].width, frames[0].height)
+                self.verdict = self.score = None
+                self.issues = []
+                self.last_cursor_id = existing["id"]
+            return {
+                "existing": True,
+                "frames": len(frames),
+                "canvas_size": self.canvas_size,
+                "hotspot": list(self.hotspot),
+                "verdict": "适合",
+                "score": 100,
+                "issues": [],
+                "src_size": list(self.src_size),
+                "previews": self.previews(),
+                "hard_reject": False,
+                "cursor_id": existing["id"],
+                "cursor_name": existing["name"],
+                "data_dir": self.store.root,
+            }
+
+        import datetime
+        processed, durations, _file_info, verdicts, worst = self._process_files(
+            [(entry["original"], data)])
+
+        # 统一缩放到画布尺寸
+        frames = [self._fit_to_canvas(img, self.canvas_size) for img, _bg in processed]
+
+        with self.lock:
+            self.frames = frames
+            self.durations = durations[: len(frames)]
+            self.hotspot = analyze(frames[0], target_size=self.canvas_size).hotspot
+            self.verdict = worst.verdict
+            self.score = worst.score
+            self.issues = [{"level": i.level, "message": i.message} for i in worst.issues]
+            self.src_size = (processed[0][0].width, processed[0][0].height)
+
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor_name = _sanitize_name(
+            entry["original"],
+            datetime.datetime.now().strftime("光标 %m-%d %H:%M"))
+        ani_bytes = build_ani_file(
+            frames=frames,
+            hotspots=[self.hotspot] * len(frames),
+            frame_durations_ms=durations[: len(frames)],
+            title=cursor_name,
+            author="Custom Cursor Web",
+        )
+        preview_buf = io.BytesIO()
+        big = frames[0].resize((frames[0].width * 4, frames[0].height * 4), Image.NEAREST)
+        big.save(preview_buf, format="PNG")
+        frames_png = []
+        for f in frames:
+            b = io.BytesIO()
+            f.save(b, format="PNG")
+            frames_png.append(b.getvalue())
+        c_entry = self.store.add_cursor(
+            ani_bytes, preview_buf.getvalue(), frames_png,
+            {"name": cursor_name, "created": now, "size": self.canvas_size,
+             "hotspot": list(self.hotspot), "frames": len(frames),
+             "animated": len(frames) > 1, "upload_ids": [uid],
+             "source_hashes": [sha]},
+        )
+        with self.lock:
+            self.last_cursor_id = c_entry["id"]
+
+        hard_reject = any(
+            it.level == "error" and it.code in HARD_REJECT_CODES for it in worst.issues
+        )
+        return {
+            "existing": False,
+            "frames": len(frames),
+            "canvas_size": self.canvas_size,
+            "hotspot": list(self.hotspot),
+            "verdict": worst.verdict,
+            "score": worst.score,
+            "issues": self.issues,
+            "src_size": list(self.src_size),
+            "previews": self.previews(),
+            "hard_reject": hard_reject,
+            "cursor_id": c_entry["id"],
+            "cursor_name": c_entry["name"],
+            "data_dir": self.store.root,
+        }
+
     def previews(self) -> list[str]:
         """当前暂存帧的 base64 预览（每帧 4x 放大 PNG）。"""
         with self.lock:
@@ -507,7 +648,7 @@ class CursorApp:
                     min(size - 1, round(self.hotspot[1] * scale)),
                 )
             if self.enabled:
-                self.mgr.replace_with_cockroach(self._rebuild_ani())
+                self.mgr.replace_cursor(self._rebuild_ani())
             return {
                 "canvas_size": size,
                 "hotspot": list(self.hotspot),
@@ -535,7 +676,7 @@ class CursorApp:
             else:
                 raise ValueError("direction 必须是 'ccw' 或 'cw'")
             if self.enabled:
-                self.mgr.replace_with_cockroach(self._rebuild_ani())
+                self.mgr.replace_cursor(self._rebuild_ani())
             return {
                 "hotspot": list(self.hotspot),
                 "enabled": self.enabled,
@@ -556,8 +697,8 @@ class CursorApp:
     def _rebuild_ani(self) -> str:
         """写入临时 .ani，返回路径。"""
         import tempfile
-        os.makedirs(os.path.join(tempfile.gettempdir(), "cockroach_cursor_web"), exist_ok=True)
-        ani_path = os.path.join(tempfile.gettempdir(), "cockroach_cursor_web", "custom.ani")
+        os.makedirs(os.path.join(tempfile.gettempdir(), "custom_cursor_web"), exist_ok=True)
+        ani_path = os.path.join(tempfile.gettempdir(), "custom_cursor_web", "custom.ani")
         durations = (self.durations if len(self.durations) == len(self.frames)
                      else [FRAME_MS] * len(self.frames))
         save_ani_file(
@@ -575,7 +716,7 @@ class CursorApp:
             if not self.frames:
                 raise ValueError("还没有可用图片，请先上传")
             ani_path = self._rebuild_ani()
-            self.mgr.replace_with_cockroach(ani_path)
+            self.mgr.replace_cursor(ani_path)
             self.enabled = True
             return True
 
@@ -590,7 +731,7 @@ class CursorApp:
             n = self.canvas_size - 1
             self.hotspot = (max(0, min(n, x)), max(0, min(n, y)))
             if self.enabled and self.frames:
-                self.mgr.replace_with_cockroach(self._rebuild_ani())
+                self.mgr.replace_cursor(self._rebuild_ani())
             return self.enabled
 
     def state(self) -> dict:
@@ -654,12 +795,76 @@ class CursorApp:
             self.verdict = self.score = None
             self.issues = []
             self.last_cursor_id = cid
-            self.mgr.replace_with_cockroach(ani_path)
+            self.mgr.replace_cursor(ani_path)
             self.enabled = True
             return {"enabled": True, "name": entry["name"], "cid": cid,
                     "canvas_size": self.canvas_size,
                     "hotspot": list(self.hotspot),
                     "frames": len(frames)}
+
+    def delete_gallery(self, kind: str, uid: str,
+                       with_uploads: bool = False,
+                       with_cursors: bool = False) -> dict:
+        """删除图库条目；可选级联删除关联条目。
+
+        删除光标且 with_uploads=True 时，仅删除"独占"图片
+        （不被其他光标引用的关联图片），共享图片保留。
+        删除图片且 with_cursors=True 时，删除所有引用它的光标。
+
+        若删除的光标是当前工作/应用中的光标：恢复系统光标并清空工作状态。
+        """
+        with self.lock:
+            deleting_cursors: list[str] = []  # 将被删除的光标 id
+            if kind == "cursors":
+                entry = self.store.get_cursor(uid)
+                if not entry:
+                    raise KeyError("光标不存在")
+                deleting_cursors.append(uid)
+                deleted_uploads = []
+                if with_uploads:
+                    for up_id in entry.get("upload_ids", []):
+                        up = self.store.get_upload(up_id)
+                        if up and not self.store.cursors_for_upload(up_id, exclude=uid):
+                            self.store.delete("uploads", up_id)
+                            deleted_uploads.append(up_id)
+                self.store.delete("cursors", uid)
+                result = {"deleted": True, "uploads_deleted": deleted_uploads}
+            elif kind == "uploads":
+                if not self.store.get_upload(uid):
+                    raise KeyError("图片不存在")
+                deleted_cursors = []
+                if with_cursors:
+                    for c in self.store.cursors_for_upload(uid):
+                        self.store.delete("cursors", c["id"])
+                        deleted_cursors.append(c["id"])
+                deleting_cursors.extend(deleted_cursors)
+                self.store.delete("uploads", uid)
+                result = {"deleted": True, "cursors_deleted": deleted_cursors}
+            else:
+                raise KeyError("未知类型")
+
+            # 正在应用/工作中的光标被删除 → 恢复系统光标 + 清空工作状态
+            if self.last_cursor_id and self.last_cursor_id in deleting_cursors:
+                was_enabled = self.enabled
+                self._reset_work_state()
+                if was_enabled:
+                    self.mgr.restore_original()
+                result["restored"] = was_enabled
+            else:
+                result["restored"] = False
+            return result
+
+    def _reset_work_state(self) -> None:
+        """清空工作状态（帧/分析/应用状态），保留画布尺寸选择。"""
+        self.frames = []
+        self.durations = []
+        self.hotspot = (self.canvas_size // 2, self.canvas_size // 2)
+        self.enabled = False
+        self.verdict = None
+        self.score = None
+        self.issues = []
+        self.src_size = None
+        self.last_cursor_id = None
 
     def cleanup(self) -> None:
         """退出时恢复光标并释放资源。"""
@@ -807,20 +1012,31 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     self._send_json(app.apply_cursor_from_gallery(uid))
                 elif kind == "cursors" and action == "rename":
                     self._send_json(app.store.rename_cursor(uid, str(data.get("name", ""))))
+                elif kind == "uploads" and action == "generate":
+                    self._send_json(app.generate_from_upload(uid))
                 elif action == "category":
                     self._send_json(app.store.set_category(kind, uid,
                                                            str(data.get("category", ""))))
                 elif action == "delete":
-                    app.store.delete(kind, uid)
-                    self._send_json({"deleted": True})
+                    self._send_json(app.delete_gallery(
+                        kind, uid,
+                        with_uploads=bool(data.get("with_uploads")),
+                        with_cursors=bool(data.get("with_cursors"))))
                 else:
                     self._send_error(404, "未知操作")
             except KeyError as e:
                 self._send_error(404, str(e))
 
         def _handle_upload(self):
-            import cgi
-            ctype, pdict = cgi.parse_header(self.headers.get("Content-Type", ""))
+            # 手写解析 Content-Type（不依赖 cgi 模块：Python 3.13 已移除）
+            raw_ct = self.headers.get("Content-Type", "")
+            parts = [p.strip() for p in raw_ct.split(";")]
+            ctype = parts[0].lower()
+            pdict = {}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    pdict[k.strip().lower()] = v.strip().strip('"')
             if ctype != "multipart/form-data" or "boundary" not in pdict:
                 self._send_error(400, "需要 multipart/form-data")
                 return

@@ -23,7 +23,12 @@ const uploading = ref(false)
 const busy = ref(false)
 const error = ref('')
 const dragging = ref(false)
-const confirm = reactive({ show: false, title: '', body: [], action: null, cancelAction: null })
+const confirm = reactive({
+  show: false, title: '', body: [],
+  action: null, action2: null,
+  actionLabel: '确定', action2Label: '',
+  cancelAction: null,
+})
 
 // 弹窗提示（Toast）
 const toast = reactive({ show: false, text: '', kind: 'ok' })
@@ -75,27 +80,35 @@ async function api(path, opts = {}) {
 }
 
 // ── 初始状态 ──────────────────────────────────────────
+async function refreshState() {
+  const s = await api('/api/state')
+  state.enabled = s.enabled
+  state.canvasSize = s.canvas_size
+  state.frames = s.frames
+  state.hotspot = s.hotspot
+  state.verdict = s.verdict
+  state.score = s.score
+  state.issues = s.issues
+  state.srcSize = s.src_size
+  state.dataDir = s.data_dir || ''
+  if (s.frames > 0) {
+    const p = await api('/api/previews')
+    state.previews = p.previews
+    animIndex.value = 0
+    startAnim()
+  } else {
+    state.previews = []
+    stopAnim()
+    animIndex.value = 0
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('error', (e) => {
     error.value = `前端错误: ${e.message}`
   })
   try {
-    const s = await api('/api/state')
-    state.enabled = s.enabled
-    state.canvasSize = s.canvas_size
-    state.frames = s.frames
-    state.hotspot = s.hotspot
-    state.verdict = s.verdict
-    state.score = s.score
-    state.issues = s.issues
-    state.srcSize = s.src_size
-    state.dataDir = s.data_dir || ''
-    if (s.frames > 0) {
-      const p = await api('/api/previews')
-      state.previews = p.previews
-      animIndex.value = 0
-      startAnim()
-    }
+    await refreshState()
     await refreshGallery()
   } catch (e) {
     error.value = `无法连接后端服务: ${e.message}`
@@ -392,20 +405,126 @@ async function saveEdit() {
   }
 }
 
+// ── 图库关联关系（前端推导；删除时以后端数据为准）──────
+function cursorsForUpload(u) {
+  return gallery.cursors.filter(c => (c.upload_ids || []).includes(u.id))
+}
+function uploadsForCursor(c) {
+  return (c.upload_ids || []).map(id => gallery.uploads.find(u => u.id === id)).filter(Boolean)
+}
+
+async function doDelete(path, payload) {
+  const r = await api(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  await refreshGallery()
+  await refreshState()
+  showToast(r.restored ? '已删除，系统光标已恢复为默认' : '已删除')
+}
+
 function delItem(kind, item) {
-  confirm.title = kind === 'cursors' ? `删除光标「${item.name}」？` : `删除图片「${item.original}」？`
-  confirm.body = ['删除后不可恢复。']
   confirm.cancelAction = null
-  confirm.action = async () => {
-    try {
-      await api(`/api/gallery/${kind}/${item.id}/delete`, { method: 'POST' })
-      await refreshGallery()
-      showToast('已删除')
-    } catch (e) {
-      error.value = `删除失败: ${e.message}`
+  confirm.action2 = null
+  confirm.action2Label = ''
+  confirm.actionLabel = '确定'
+  if (kind === 'cursors') {
+    const ups = uploadsForCursor(item)
+    const exclusive = ups.filter(u => cursorsForUpload(u).length <= 1)
+    const shared = ups.filter(u => cursorsForUpload(u).length > 1)
+    confirm.title = `删除光标「${item.name}」？`
+    confirm.body = ['删除后不可恢复。']
+    if (exclusive.length) confirm.body.push(`${exclusive.length} 张图片仅被此光标使用。`)
+    if (shared.length) confirm.body.push(`${shared.length} 张图片同时被其他光标使用，将保留。`)
+    confirm.action = async () => {
+      try {
+        await doDelete(`/api/gallery/cursors/${item.id}/delete`,
+                       { with_uploads: exclusive.length > 0 })
+      } catch (e) { error.value = `删除失败: ${e.message}` }
+    }
+    if (exclusive.length) {
+      confirm.actionLabel = '光标与图片一起删除'
+      confirm.action2 = async () => {
+        try {
+          await doDelete(`/api/gallery/cursors/${item.id}/delete`,
+                         { with_uploads: false })
+        } catch (e) { error.value = `删除失败: ${e.message}` }
+      }
+      confirm.action2Label = '仅删除光标'
+    } else {
+      confirm.actionLabel = '删除'
+    }
+  } else {
+    const cs = cursorsForUpload(item)
+    confirm.title = `删除图片「${item.original}」？`
+    confirm.body = ['删除后不可恢复。']
+    if (cs.length) confirm.body.push(`${cs.length} 个光标由这张图片生成。`)
+    confirm.action = async () => {
+      try {
+        await doDelete(`/api/gallery/uploads/${item.id}/delete`,
+                       { with_cursors: cs.length > 0 })
+      } catch (e) { error.value = `删除失败: ${e.message}` }
+    }
+    if (cs.length) {
+      confirm.actionLabel = '图片与光标一起删除'
+      confirm.action2 = async () => {
+        try {
+          await doDelete(`/api/gallery/uploads/${item.id}/delete`,
+                         { with_cursors: false })
+        } catch (e) { error.value = `删除失败: ${e.message}` }
+      }
+      confirm.action2Label = '仅删除图片'
+    } else {
+      confirm.actionLabel = '删除'
     }
   }
   confirm.show = true
+}
+
+// ── 从图库图片生成光标 ────────────────────────────────
+async function generateFromUpload(u) {
+  busy.value = true
+  error.value = ''
+  try {
+    const r = await api(`/api/gallery/uploads/${u.id}/generate`, { method: 'POST' })
+    state.previews = r.previews
+    state.hotspot = r.hotspot
+    state.frames = r.frames
+    state.canvasSize = r.canvas_size
+    state.srcSize = r.src_size
+    state.verdict = r.verdict
+    state.score = r.score
+    state.issues = r.issues
+    state.dataDir = r.data_dir || state.dataDir
+    animIndex.value = 0
+    startAnim()
+    await refreshGallery()
+    if (r.hard_reject) {
+      showToast('图片不适合做光标，未应用', 'warn')
+      return
+    }
+    const applyAndNotify = async () => {
+      await apply()
+      showToast(r.existing
+        ? `已应用相同内容的光标「${r.cursor_name}」`
+        : `已生成光标「${r.cursor_name}」并应用`)
+    }
+    if (r.verdict === '不适合' || r.verdict === '有风险') {
+      confirm.title = r.verdict === '不适合' ? '图片不适合做光标' : '图片可能不适合'
+      confirm.body = r.issues.map(i => `• ${i.message}`)
+      confirm.action = applyAndNotify
+      confirm.action2 = null
+      confirm.action2Label = ''
+      confirm.cancelAction = null
+      confirm.show = true
+    } else {
+      await applyAndNotify()
+    }
+  } catch (e) {
+    error.value = `生成光标失败: ${e.message}`
+  } finally {
+    busy.value = false
+  }
 }
 
 // ── 关闭窗口 → 请求退出 ───────────────────────────────
@@ -534,7 +653,15 @@ function quitApp() {
             {{ u.size[0] }}×{{ u.size[1] }} · 判定 {{ u.verdict }} ({{ u.score }}分)
             <span v-if="u.category" class="gcat">#{{ u.category }}</span>
           </div>
+          <div class="gmeta">
+            <span v-if="cursorsForUpload(u).length" class="gcur has">
+              🖱 已有 {{ cursorsForUpload(u).length }} 个光标
+            </span>
+            <span v-else class="gcur">⚠ 尚未生成光标</span>
+          </div>
           <div class="gactions">
+            <button v-if="!cursorsForUpload(u).length" class="btn tiny primary"
+                    :disabled="busy" @click="generateFromUpload(u)">生成光标</button>
             <button class="btn tiny" @click="openCategory('uploads', u)">归类</button>
             <button class="btn tiny danger" @click="delItem('uploads', u)">删除</button>
           </div>
@@ -571,7 +698,8 @@ function quitApp() {
         </ul>
         <div class="modal-actions">
           <button class="btn" @click="confirm.cancelAction ? (confirm.cancelAction(), confirm.show = false) : (confirm.show = false)">取消</button>
-          <button v-if="confirm.action" class="btn primary" @click="confirm.action(); confirm.show = false">确定</button>
+          <button v-if="confirm.action2" class="btn" @click="confirm.action2(); confirm.show = false">{{ confirm.action2Label || '仅删除本条' }}</button>
+          <button v-if="confirm.action" class="btn primary" @click="confirm.action(); confirm.show = false">{{ confirm.actionLabel || '确定' }}</button>
         </div>
       </div>
     </div>

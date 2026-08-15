@@ -80,7 +80,8 @@ def make_gif(duration_ms=200):
     return buf.getvalue()
 
 def main():
-    store_root = tempfile.mkdtemp(prefix="cockroach_test_")
+    store_root = (os.environ.get("CCC_TEST_ROOT")
+                  or tempfile.mkdtemp(prefix="custom_cursor_test_"))
     app = CursorApp(store_root=store_root)
     server = start_server(app)
     url = f"http://127.0.0.1:{server.server_address[1]}"
@@ -277,7 +278,7 @@ def main():
     check("GIF 预览 2 张", len(gif_up["previews"]) == 2)
     req("POST", url + "/api/apply")
     import struct as _struct
-    ani_path = os.path.join(tempfile.gettempdir(), "cockroach_cursor_web", "custom.ani")
+    ani_path = os.path.join(tempfile.gettempdir(), "custom_cursor_web", "custom.ani")
     with open(ani_path, "rb") as f:
         ani = f.read()
     rate_idx = ani.find(b"rate")
@@ -315,7 +316,112 @@ def main():
     check("空白图判不适合", bad["verdict"] == "不适合", f"score={bad['score']}")
     check("空白图 hard_reject=True", bad.get("hard_reject") is True)
 
-    # 7. 静态首页
+    # 7. 关联删除 & 图库生成光标
+    def upload_one(color):
+        buf = io.BytesIO()
+        make_arrow(color).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def gallery():
+        _, g = req("GET", url + "/api/gallery")
+        return g
+
+    def post_json(path, payload):
+        return req("POST", path, json.dumps(payload).encode(),
+                   {"Content-Type": "application/json"})
+
+    # 7a. 删除图片 → 级联删除关联光标
+    _, up1 = upload(url, [upload_one((60, 200, 255, 255))])
+    u1, c1 = up1["upload_ids"][0], up1["cursor_id"]
+    post_json(url + f"/api/gallery/uploads/{u1}/delete", {"with_cursors": True})
+    g1 = gallery()
+    check("删除图片级联删除关联光标", all(x["id"] != c1 for x in g1["cursors"])
+          and all(x["id"] != u1 for x in g1["uploads"]))
+
+    # 7b. 删除光标 → 级联删除独占图片
+    _, up2 = upload(url, [upload_one((200, 60, 255, 255))])
+    u2, c2 = up2["upload_ids"][0], up2["cursor_id"]
+    post_json(url + f"/api/gallery/cursors/{c2}/delete", {"with_uploads": True})
+    g2 = gallery()
+    check("删除光标级联删除独占图片", all(x["id"] != c2 for x in g2["cursors"])
+          and all(x["id"] != u2 for x in g2["uploads"]))
+
+    # 7c. 仅删光标 → 图片保留（不级联）
+    _, up3 = upload(url, [upload_one((255, 220, 90, 255))])
+    u3, c3 = up3["upload_ids"][0], up3["cursor_id"]
+    post_json(url + f"/api/gallery/cursors/{c3}/delete", {"with_uploads": False})
+    g3 = gallery()
+    check("仅删光标时图片保留", all(x["id"] != c3 for x in g3["cursors"])
+          and any(x["id"] == u3 for x in g3["uploads"]))
+    post_json(url + f"/api/gallery/uploads/{u3}/delete", {"with_cursors": False})
+
+    # 7d. 图库生成光标: 无光标图片 → generate 生成并关联
+    _, up4 = upload(url, [upload_one((120, 255, 180, 255))])
+    u4, c4 = up4["upload_ids"][0], up4["cursor_id"]
+    post_json(url + f"/api/gallery/cursors/{c4}/delete", {"with_uploads": False})
+    _, gen = req("POST", url + f"/api/gallery/uploads/{u4}/generate", b"",
+                 {"Content-Type": "application/json"})
+    check("图库生成光标 existing=False", gen.get("existing") is False,
+          str(gen.get("error", "")))
+    g4 = gallery()
+    u4_cursors = [x for x in g4["cursors"] if u4 in x.get("upload_ids", [])]
+    check("生成的光标关联该图片", len(u4_cursors) == 1)
+
+    # 7e. generate 内容查重: 已有相同光标 → existing=True 复用不新增
+    n_before = len(g4["cursors"])
+    _, gen2 = req("POST", url + f"/api/gallery/uploads/{u4}/generate", b"",
+                  {"Content-Type": "application/json"})
+    g5 = gallery()
+    check("重复生成复用已有光标", gen2.get("existing") is True
+          and len(g5["cursors"]) == n_before)
+
+    # 7f. 共享图片保护: 多图光标中的图被另一光标引用时，删光标不删共享图
+    _, up5 = upload(url, [upload_one((255, 120, 120, 255)),
+                          upload_one((120, 120, 255, 255))])
+    u5, u6 = up5["upload_ids"]
+    c5 = up5["cursor_id"]
+    req("POST", url + f"/api/gallery/uploads/{u5}/generate", b"",
+        {"Content-Type": "application/json"})   # u5 再生成独立光标 → 共享
+    post_json(url + f"/api/gallery/cursors/{c5}/delete", {"with_uploads": True})
+    g6 = gallery()
+    check("共享图片 u5 保留", any(x["id"] == u5 for x in g6["uploads"]))
+    check("独占图片 u6 被级联删除", all(x["id"] != u6 for x in g6["uploads"]))
+    check("多图光标已删除", all(x["id"] != c5 for x in g6["cursors"]))
+
+    # 7g. 删除正在应用的光标 → 恢复系统光标并清空工作状态
+    _, up7 = upload(url, [upload_one((90, 255, 90, 255))])
+    u7, c7 = up7["upload_ids"][0], up7["cursor_id"]
+    req("POST", url + "/api/apply")
+    _, st7 = req("GET", url + "/api/state")
+    check("删除前已启用", st7["enabled"] is True and st7["frames"] == 1)
+    _, del7 = post_json(url + f"/api/gallery/cursors/{c7}/delete", {"with_uploads": True})
+    _, st8 = req("GET", url + "/api/state")
+    check("删除应用中的光标后恢复系统光标",
+          del7.get("restored") is True and st8["enabled"] is False)
+    check("删除应用中的光标后工作状态清空",
+          st8["frames"] == 0 and st8["last_cursor_id"] is None)
+
+    # 7h. 删除未应用但为当前工作来源的光标 → 清空工作状态（不恢复系统光标）
+    _, up8 = upload(url, [upload_one((200, 90, 200, 255))])
+    u8, c8 = up8["upload_ids"][0], up8["cursor_id"]
+    _, del8 = post_json(url + f"/api/gallery/cursors/{c8}/delete", {"with_uploads": False})
+    _, st9 = req("GET", url + "/api/state")
+    check("删除未应用的工作光标仅清空状态",
+          del8.get("restored") is False and st9["frames"] == 0
+          and st9["enabled"] is False)
+    post_json(url + f"/api/gallery/uploads/{u8}/delete", {"with_cursors": False})
+
+    # 7i. 删除图片级联删除应用中的光标 → 同样恢复系统光标
+    _, up9 = upload(url, [upload_one((90, 200, 200, 255))])
+    u9, c9 = up9["upload_ids"][0], up9["cursor_id"]
+    req("POST", url + "/api/apply")
+    _, del9 = post_json(url + f"/api/gallery/uploads/{u9}/delete", {"with_cursors": True})
+    _, st10 = req("GET", url + "/api/state")
+    check("级联删除应用中的光标也恢复系统光标",
+          del9.get("restored") is True and st10["enabled"] is False
+          and st10["frames"] == 0)
+
+    # 8. 静态首页
     r = urllib.request.urlopen(url + "/", timeout=15)
     html = r.read().decode("utf-8")
     check("首页返回 HTML", r.status == 200 and "<div id=\"app\"" in html)
