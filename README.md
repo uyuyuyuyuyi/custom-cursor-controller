@@ -110,17 +110,23 @@ python build_resources.py
 
 ## 🎨 Custom pattern / 自定义图案
 
-### 方式一：图形界面（推荐）
+### 方式一：Web 图形界面（推荐，Vue 3 + pywebview）
 
-`dist\CockroachCursorGUI.exe` 是图形界面版，双击进入 GUI，可以：
-- **上传图片** → 程序自动判断图片**适不适合做光标**（空白/对比度低/细节过多/无法抠背景等会被拦截或警告，用户可强制使用）
+`dist\CockroachCursorGUIWeb.exe` 是 **Vue 3 现代化界面**的桌面窗口版（pywebview/WebView2 渲染，不再是原生控件样式），双击进入 GUI，可以：
+- **上传图片**（拖拽或点击）→ 程序自动判断图片**适不适合做光标**（空白/对比度低/细节过多/无法抠背景等会被拦截或警告，用户可强制使用）
 - **一键开关**"自定义光标是否生效"
-- 点击预览图设置热点（点击点位置）；选择多张图片可生成动画光标
-- 关闭窗口最小化到托盘，退出时自动恢复系统光标
+- 点击预览图设置热点（点击点位置）；多选图片生成**动画光标**（预览实时轮播）
+- 关闭窗口最小化到托盘（光标保持生效），退出时自动恢复系统光标
 
-源码运行：`python cockroach_gui.pyw`；打包：`pyinstaller CockroachCursorGUI.spec --noconfirm`
+架构：Vue 3 前端（`webui/`）由 Python 本地 HTTP 服务托管，复用全部现有核心逻辑（分析/抠背景/生成 .ani/替换光标）。
 
-### 方式二：命令行脚本
+源码运行：`python cockroach_gui_web.pyw`；前端构建：`cd webui && npm install && npm run build`；打包：`pyinstaller CockroachCursorGUIWeb.spec --noconfirm`
+
+### 方式二：tkinter 图形界面（旧版）
+
+`dist\CockroachCursorGUI.exe` 是 tkinter 原生控件版，功能相同、界面朴素。源码运行：`python cockroach_gui.pyw`；打包：`pyinstaller CockroachCursorGUI.spec --noconfirm`
+
+### 方式三：命令行脚本
 
 ```bash
 # Static cursor from one image / 一张图 = 静态光标
@@ -150,7 +156,13 @@ cockroach/
 ├── cockroach_cursor.pyw   # Main entry: tray app + Win32 cursor management (main program)
 │                          # 主入口：托盘程序 + Win32 光标管理
 ├── cockroach_gui.pyw      # GUI app: upload image → suitability check → toggle cursor on/off
-│                          # 图形界面：上传图片→适合度判断→生成光标→开关
+│                          # 图形界面（tkinter 版）：上传图片→适合度判断→生成光标→开关
+├── cockroach_gui_web.pyw  # Web GUI entry: pywebview window + Vue frontend
+│                          # 图形界面（Web 版）入口：pywebview 窗口承载 Vue 前端
+├── gui_server.py          # Local HTTP API server for the Vue frontend
+│                          # 为 Vue 前端提供本地 HTTP API 的后端服务
+├── webui/                 # Vue 3 + Vite frontend source (build output served by gui_server)
+│                          # Vue 3 前端源码（构建产物由 gui_server 托管）
 ├── pointer_analyzer.py    # Image suitability scoring (blank/contrast/complexity/bg removal)
 │                          # 图片适合度分析（空白/对比度/复杂度/抠背景）
 ├── cursor_drawer.py       # Drawing engine: 48×48 white cockroach, 8-frame animation
@@ -167,8 +179,10 @@ cockroach/
 │                          # 深度诊断：解析内部 fram LIST，导出每帧 PNG
 ├── CockroachCursor.spec   # PyInstaller spec (single-file, resources embedded)
 │                          # PyInstaller 配置（单文件，资源内嵌）
-├── CockroachCursorGUI.spec  # PyInstaller spec for the GUI version (no embedded assets)
-│                          # GUI 版打包配置（无需内嵌资源）
+├── CockroachCursorGUI.spec  # PyInstaller spec for the tkinter GUI version
+│                          # tkinter 版打包配置
+├── CockroachCursorGUIWeb.spec # PyInstaller spec for the Web GUI version
+│                          # Web 版打包配置（内嵌 webui/dist 前端）
 ├── requirements.txt       # pystray + Pillow
 ├── colored_cockroach.png  # Reference photo for morphology (not packaged)
 │                          # 形态参考照片（不参与打包）

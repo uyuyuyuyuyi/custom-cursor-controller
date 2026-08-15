@@ -26,6 +26,10 @@ cockroach_tray_icon.png
 # Runtime generated resources (程序首次运行自动生成)
 resources/
 
+# Node (Vue frontend deps; webui/dist 保留入库以支持直接打包)
+webui/node_modules/
+webui/.npm-cache/
+
 # OS
 Thumbs.db
 Desktop.ini
