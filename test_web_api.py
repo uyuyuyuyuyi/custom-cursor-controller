@@ -27,12 +27,15 @@ def req(method, url, body=None, headers=None):
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 def upload(url, images):
-    """手工构造 multipart/form-data"""
+    """手工构造 multipart/form-data；每项可为 PIL Image 或已编码的 bytes。"""
     boundary = "----testboundary1234"
     parts = []
-    for i, img in enumerate(images):
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
+    for i, item in enumerate(images):
+        if isinstance(item, bytes):
+            buf = io.BytesIO(item)
+        else:
+            buf = io.BytesIO()
+            item.save(buf, format="PNG")
         parts.append(
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="files"; filename="f{i}.png"\r\n'
@@ -65,6 +68,15 @@ def preview_pixel(previews, i, x, y):
 def make_blank():
     return Image.new("RGBA", (48, 48), (0, 0, 0, 0))
 
+def make_gif(duration_ms=200):
+    """两帧透明背景 GIF（白箭头 + 黄箭头）。"""
+    frames = [make_arrow((255, 255, 255, 255)), make_arrow((255, 200, 60, 255))]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True,
+                   append_images=frames[1:], duration=duration_ms, loop=0,
+                   disposal=2, transparency=0)
+    return buf.getvalue()
+
 def main():
     app = CursorApp()
     server = start_server(app)
@@ -74,6 +86,7 @@ def main():
     # 1. 初始状态
     _, st = req("GET", url + "/api/state")
     check("初始 enabled=False", st["enabled"] is False, f"frames={st['frames']}")
+    check("默认画布 64", st.get("canvas_size") == 64, f"canvas={st.get('canvas_size')}")
 
     # 2. 上传两张箭头（动画）
     _, up = upload(url, [make_arrow(), make_arrow((255, 200, 60, 255))])
@@ -98,6 +111,12 @@ def main():
     # 5. 恢复
     _, rs = req("POST", url + "/api/restore")
     check("restore 后 enabled=False", rs["enabled"] is False)
+
+    # 5a. 切换到 48 画布（旋转用例的像素坐标按 48 画布设计）
+    _, sz48 = req("POST", url + "/api/size",
+                  json.dumps({"size": 48}).encode(),
+                  {"Content-Type": "application/json"})
+    check("切到 48 画布", sz48.get("canvas_size") == 48)
 
     # 5b. 旋转 90°（左箭头: 尖在左 x=6..18，尾 x=18..42）
     _, up2 = upload(url, [make_left_arrow()])
@@ -142,6 +161,44 @@ def main():
         check("非法方向被拒绝", False)
     except urllib.error.HTTPError as e:
         check("非法方向被拒绝 (400)", e.code == 400)
+
+    # 5c. 画布尺寸切换: 先重置热点 (10,20)，48 → 96 等比缩放为 (20,40)
+    req("POST", url + "/api/hotspot",
+        json.dumps({"x": 10, "y": 20}).encode(),
+        {"Content-Type": "application/json"})
+    _, sz96 = req("POST", url + "/api/size",
+                  json.dumps({"size": 96}).encode(),
+                  {"Content-Type": "application/json"})
+    check("切到 96 画布", sz96.get("canvas_size") == 96)
+    check("96 画布热点等比缩放 (20,40)", sz96["hotspot"] == [20, 40], str(sz96["hotspot"]))
+    check("96 画布箭头仍在 (48,48)", preview_pixel(sz96["previews"], 0, 48, 48)[3] > 200)
+    _, sz48b = req("POST", url + "/api/size",
+                   json.dumps({"size": 48}).encode(),
+                   {"Content-Type": "application/json"})
+    check("切回 48 热点还原 (10,20)", sz48b["hotspot"] == [10, 20], str(sz48b["hotspot"]))
+    try:
+        req("POST", url + "/api/size",
+            json.dumps({"size": 55}).encode(),
+            {"Content-Type": "application/json"})
+        check("非法尺寸被拒绝", False)
+    except urllib.error.HTTPError as e:
+        check("非法尺寸被拒绝 (400)", e.code == 400)
+
+    # 5d. GIF 动画: 提取全部帧 + 使用 GIF 自带帧时长
+    gif_bytes = make_gif()
+    _, gif_up = upload(url, [gif_bytes])
+    check("GIF 提取 2 帧", gif_up["frames"] == 2, f"frames={gif_up['frames']}")
+    check("GIF 预览 2 张", len(gif_up["previews"]) == 2)
+    req("POST", url + "/api/apply")
+    import tempfile, os, struct as _struct
+    ani_path = os.path.join(tempfile.gettempdir(), "cockroach_cursor_web", "custom.ani")
+    with open(ani_path, "rb") as f:
+        ani = f.read()
+    rate_idx = ani.find(b"rate")
+    rate_size = _struct.unpack_from("<I", ani, rate_idx + 4)[0]
+    jiffies = list(_struct.unpack_from("<" + "I" * (rate_size // 4), ani, rate_idx + 8))
+    check("GIF 帧时长 200ms → jiffies=[12,12]", jiffies == [12, 12], str(jiffies))
+    req("POST", url + "/api/restore")
 
     # 6. 空白图 → 硬拒绝
     _, bad = upload(url, [make_blank()])

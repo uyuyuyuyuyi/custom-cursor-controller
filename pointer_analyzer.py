@@ -30,8 +30,6 @@ from PIL import Image
 
 # 光标画布尺寸（与 cursor_drawer / make_custom_cursor 保持一致）
 TARGET_SIZE = 48
-# 分析用的降采样尺寸（提速）
-ANALYZE_SIZE = 48
 # 自动抠背景时的工作尺寸
 BG_WORK_SIZE = 160
 
@@ -252,10 +250,10 @@ def analyze(
     stats["alpha_range"] = alpha_all
     has_real_alpha = alpha_all[0] < 250
 
-    # 1) 空白检查（先降采样，避免大图遍历）
-    small = img.resize((ANALYZE_SIZE, ANALYZE_SIZE), Image.LANCZOS)
+    # 1) 空白检查（降采样到目标尺寸，统计与热点均在此坐标空间）
+    small = img.resize((target_size, target_size), Image.LANCZOS)
     opaque = _opaque_pixels(small)
-    opaque_ratio = len(opaque) / (ANALYZE_SIZE * ANALYZE_SIZE)
+    opaque_ratio = len(opaque) / (target_size * target_size)
     stats["opaque_ratio"] = round(opaque_ratio, 3)
 
     if opaque_ratio < 0.02:

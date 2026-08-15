@@ -33,8 +33,10 @@ from ani_builder import save_ani_file
 from pointer_analyzer import HARD_REJECT_CODES, analyze, auto_remove_background
 from cockroach_cursor import CursorManager
 
-CANVAS_SIZE = 48
-FRAME_MS = 150
+CANVAS_SIZE = 48            # 旧默认（兼容引用）
+DEFAULT_CANVAS_SIZE = 64    # 光标画布尺寸（可在界面选择 48/64/96）
+FRAME_MS = 150              # 默认帧时长
+SIZE_CHOICES = (32, 48, 64, 96, 128)
 
 # 静态前端目录: 源码运行时在 webui/dist，打包后在 _MEIPASS/webui
 def _find_webui_dir() -> str | None:
@@ -55,8 +57,10 @@ class CursorApp:
         self.mgr = CursorManager()
         self.mgr.backup_original()
         self.lock = threading.Lock()
+        self.canvas_size = DEFAULT_CANVAS_SIZE
         self.frames: list[Image.Image] = []
-        self.hotspot = (CANVAS_SIZE // 2, CANVAS_SIZE // 2)
+        self.durations: list[int] = []
+        self.hotspot = (self.canvas_size // 2, self.canvas_size // 2)
         self.enabled = False
         self.verdict: str | None = None
         self.score: int | None = None
@@ -64,18 +68,32 @@ class CursorApp:
         self.src_size: tuple[int, int] | None = None
 
     # ── 上传 → 分析 ────────────────────────────────────
+    def _bg_check(self, img: Image.Image) -> tuple[Image.Image, bool]:
+        """无透明通道则自动抠背景。返回 (处理后图, 背景是否OK)。"""
+        has_alpha = img.getchannel("A").getextrema()[0] < 250
+        if has_alpha:
+            return img, True
+        return auto_remove_background(img)
+
     def upload(self, file_items: list[tuple[str, bytes]]) -> dict:
         processed: list[tuple[Image.Image, bool]] = []  # (处理后图, 抠背景是否成功)
+        durations: list[int] = []
+
         for _name, data in file_items:
-            img = Image.open(io.BytesIO(data))
-            if img.mode != "RGBA":
-                img = img.convert("RGBA")
-            has_alpha = img.getchannel("A").getextrema()[0] < 250
-            if has_alpha:
-                processed.append((img, True))
+            src = Image.open(io.BytesIO(data))
+            n_frames = getattr(src, "n_frames", 1)
+            if n_frames > 1:
+                # 动画图片（GIF 等）: 提取全部帧，用其自带帧时长
+                for i in range(n_frames):
+                    src.seek(i)
+                    img = src.convert("RGBA")
+                    dur = int(src.info.get("duration", FRAME_MS) or FRAME_MS)
+                    durations.append(max(20, min(2000, dur)))
+                    processed.append(self._bg_check(img))
             else:
-                out, ok = auto_remove_background(img)
-                processed.append((out, ok))
+                img = src.convert("RGBA")
+                durations.append(FRAME_MS)
+                processed.append(self._bg_check(img))
 
         # 逐张分析，取最差
         verdicts = []
@@ -85,15 +103,16 @@ class CursorApp:
             verdicts.append(analyze(img, removal_ok=removal))
         worst = min(verdicts, key=lambda a: a.score)
 
-        # 统一缩放到 48×48
+        # 统一缩放到画布尺寸
         frames = []
         for img, _bg in processed:
-            canvas = self._fit_to_canvas(img, CANVAS_SIZE)
+            canvas = self._fit_to_canvas(img, self.canvas_size)
             frames.append(canvas)
 
         with self.lock:
             self.frames = frames
-            self.hotspot = analyze(frames[0]).hotspot
+            self.durations = durations[: len(frames)]
+            self.hotspot = analyze(frames[0], target_size=self.canvas_size).hotspot
             self.verdict = worst.verdict
             self.score = worst.score
             self.issues = [{"level": i.level, "message": i.message} for i in worst.issues]
@@ -108,6 +127,7 @@ class CursorApp:
 
         return {
             "frames": len(frames),
+            "canvas_size": self.canvas_size,
             "hotspot": list(self.hotspot),
             "verdict": worst.verdict,
             "score": worst.score,
@@ -125,12 +145,35 @@ class CursorApp:
     def _previews_unlocked(self) -> list[str]:
         out = []
         for f in self.frames:
-            big = f.resize((CANVAS_SIZE * 4, CANVAS_SIZE * 4), Image.NEAREST)
+            big = f.resize((f.width * 4, f.height * 4), Image.NEAREST)
             buf = io.BytesIO()
             big.save(buf, format="PNG")
             out.append("data:image/png;base64,"
                        + base64.b64encode(buf.getvalue()).decode())
         return out
+
+    def set_size(self, size: int) -> dict:
+        """调整光标画布尺寸；已有帧和热点等比缩放；启用中立即重新生效。"""
+        if size not in SIZE_CHOICES:
+            raise ValueError(f"size 必须是 {'/'.join(map(str, SIZE_CHOICES))} 之一")
+        with self.lock:
+            old = self.canvas_size
+            self.canvas_size = size
+            if self.frames and size != old:
+                scale = size / old
+                self.frames = [f.resize((size, size), Image.LANCZOS) for f in self.frames]
+                self.hotspot = (
+                    min(size - 1, round(self.hotspot[0] * scale)),
+                    min(size - 1, round(self.hotspot[1] * scale)),
+                )
+            if self.enabled:
+                self.mgr.replace_with_cockroach(self._rebuild_ani())
+            return {
+                "canvas_size": size,
+                "hotspot": list(self.hotspot),
+                "enabled": self.enabled,
+                "previews": self._previews_unlocked(),
+            }
 
     def rotate(self, direction: str) -> dict:
         """将所有暂存帧旋转 90°；热点同步变换；启用中立即重新生效。
@@ -142,12 +185,13 @@ class CursorApp:
             if not self.frames:
                 raise ValueError("还没有可用图片，请先上传")
             hx, hy = self.hotspot
+            n = self.canvas_size - 1
             if direction == "ccw":
                 self.frames = [f.transpose(Image.Transpose.ROTATE_90) for f in self.frames]
-                self.hotspot = (CANVAS_SIZE - 1 - hy, hx)
+                self.hotspot = (n - hy, hx)
             elif direction == "cw":
                 self.frames = [f.transpose(Image.Transpose.ROTATE_270) for f in self.frames]
-                self.hotspot = (hy, CANVAS_SIZE - 1 - hx)
+                self.hotspot = (hy, n - hx)
             else:
                 raise ValueError("direction 必须是 'ccw' 或 'cw'")
             if self.enabled:
@@ -174,11 +218,13 @@ class CursorApp:
         import tempfile
         os.makedirs(os.path.join(tempfile.gettempdir(), "cockroach_cursor_web"), exist_ok=True)
         ani_path = os.path.join(tempfile.gettempdir(), "cockroach_cursor_web", "custom.ani")
+        durations = (self.durations if len(self.durations) == len(self.frames)
+                     else [FRAME_MS] * len(self.frames))
         save_ani_file(
             ani_path,
             frames=self.frames,
             hotspots=[self.hotspot] * len(self.frames),
-            frame_durations_ms=[FRAME_MS] * len(self.frames),
+            frame_durations_ms=durations,
             title="Custom Cursor",
             author="Custom Cursor Web",
         )
@@ -201,7 +247,8 @@ class CursorApp:
 
     def set_hotspot(self, x: int, y: int) -> bool:
         with self.lock:
-            self.hotspot = (max(0, min(CANVAS_SIZE - 1, x)), max(0, min(CANVAS_SIZE - 1, y)))
+            n = self.canvas_size - 1
+            self.hotspot = (max(0, min(n, x)), max(0, min(n, y)))
             if self.enabled and self.frames:
                 self.mgr.replace_with_cockroach(self._rebuild_ani())
             return self.enabled
@@ -210,6 +257,7 @@ class CursorApp:
         with self.lock:
             return {
                 "enabled": self.enabled,
+                "canvas_size": self.canvas_size,
                 "frames": len(self.frames),
                 "hotspot": list(self.hotspot),
                 "verdict": self.verdict,
@@ -300,6 +348,10 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     length = int(self.headers.get("Content-Length", 0))
                     data = json.loads(self.rfile.read(length) or b"{}")
                     self._send_json(app.rotate(str(data.get("direction", ""))))
+                elif path == "/api/size":
+                    length = int(self.headers.get("Content-Length", 0))
+                    data = json.loads(self.rfile.read(length) or b"{}")
+                    self._send_json(app.set_size(int(data.get("size", DEFAULT_CANVAS_SIZE))))
                 elif path == "/api/quit":
                     self._send_json({"bye": True})
                     threading.Thread(target=quit_callback, daemon=True).start()

@@ -4,6 +4,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 // ── 状态 ──────────────────────────────────────────────
 const state = reactive({
   enabled: false,
+  canvasSize: 64,
   frames: 0,
   hotspot: [24, 28],
   verdict: null,        // 适合 | 有风险 | 不适合
@@ -25,6 +26,10 @@ const animIndex = ref(0)
 const previewCount = computed(() => state.previews.length)
 const currentPreview = computed(() =>
   state.previews.length ? state.previews[animIndex.value % state.previews.length] : null)
+
+// 预览画布像素尺寸（随光标大小自适应，最大约 256px）
+const previewScale = computed(() => Math.max(2, Math.floor(256 / (state.canvasSize || 64))))
+const previewPx = computed(() => (state.canvasSize || 64) * previewScale.value)
 
 function startAnim() {
   stopAnim()
@@ -164,28 +169,48 @@ async function rotate(dir) {
   } finally { busy.value = false }
 }
 
+// ── 光标大小 ──────────────────────────────────────────
+async function setSize(s) {
+  if (s === state.canvasSize) return
+  busy.value = true
+  error.value = ''
+  try {
+    const r = await api('/api/size', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ size: s }),
+    })
+    state.canvasSize = r.canvas_size
+    state.hotspot = r.hotspot
+    state.enabled = r.enabled
+    state.previews = r.previews
+    animIndex.value = 0
+  } catch (e) {
+    error.value = `调整大小失败: ${e.message}`
+  } finally { busy.value = false }
+}
+
 // ── 热点 ──────────────────────────────────────────────
-const CANVAS_SIZE = 48          // 光标画布逻辑尺寸（与服务端一致）
-const PREVIEW_SCALE = 4         // 预览放大倍率（画布实际 192×192）
 const canvasRef = ref(null)
 function onCanvasClick(e) {
   const c = canvasRef.value
   if (!c || !state.frames) return
   const rect = c.getBoundingClientRect()
-  const x = Math.min(47, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * 48)))
-  const y = Math.min(47, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * 48)))
+  const n = state.canvasSize - 1
+  const x = Math.min(n, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * state.canvasSize)))
+  const y = Math.min(n, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * state.canvasSize)))
   state.hotspot = [x, y]
   api('/api/hotspot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) })
     .then(r => { state.enabled = r.enabled })
     .catch(e => { error.value = `热点更新失败: ${e.message}` })
 }
 
-// 绘制预览画布（棋盘格 + 当前帧 + 热点十字，全部按画布真实尺寸 192×192）
+// 绘制预览画布（棋盘格 + 当前帧 + 热点十字，全部按画布真实尺寸）
 function drawPreview() {
   const c = canvasRef.value
   if (!c) return
   const ctx = c.getContext('2d')
-  const CS = CANVAS_SIZE * PREVIEW_SCALE   // 192
+  const CS = previewPx.value
   ctx.clearRect(0, 0, c.width, c.height)
   // 棋盘格铺满整个画布
   const cell = 12
@@ -194,7 +219,7 @@ function drawPreview() {
       ctx.fillStyle = ((x / cell + y / cell) % 2 === 0) ? '#e8e8e8' : '#ffffff'
       ctx.fillRect(x, y, cell, cell)
     }
-  // 图案（服务端已按 4 倍放大到 192×192，直接 1:1 绘制，保持像素锐利）
+  // 图案（服务端已按 4 倍放大，直接 1:1 绘制，保持像素锐利）
   if (currentPreview.value) {
     const img = new Image()
     img.onload = () => {
@@ -209,18 +234,19 @@ function drawPreview() {
 }
 function drawHotspot(ctx, CS) {
   const [hx, hy] = state.hotspot
-  const px = hx * PREVIEW_SCALE
-  const py = hy * PREVIEW_SCALE
-  const half = 4 * PREVIEW_SCALE
+  const s = previewScale.value
+  const px = hx * s
+  const py = hy * s
+  const half = 4 * s
   ctx.strokeStyle = '#ff3030'
   ctx.lineWidth = 1.2
   ctx.beginPath()
   ctx.moveTo(px - half, py); ctx.lineTo(px + half, py)
   ctx.moveTo(px, py - half); ctx.lineTo(px, py + half)
   ctx.stroke()
-  ctx.beginPath(); ctx.arc(px, py, 3 * PREVIEW_SCALE, 0, Math.PI * 2); ctx.stroke()
+  ctx.beginPath(); ctx.arc(px, py, 3 * s, 0, Math.PI * 2); ctx.stroke()
 }
-watch([currentPreview, () => state.hotspot.join(',')], drawPreview, { flush: 'post' })
+watch([currentPreview, () => state.hotspot.join(','), previewPx], drawPreview, { flush: 'post' })
 
 // ── 关闭窗口 → 请求退出 ───────────────────────────────
 function quitApp() {
@@ -251,9 +277,16 @@ function quitApp() {
       <!-- 左列: 预览 -->
       <section class="card preview-card">
         <h2>预览 <small>点击画面设置热点（点击点位置）</small></h2>
-        <canvas ref="canvasRef" :width="CANVAS_SIZE * PREVIEW_SCALE" :height="CANVAS_SIZE * PREVIEW_SCALE"
+        <canvas ref="canvasRef" :width="previewPx" :height="previewPx"
+                :style="{ width: previewPx + 'px', height: previewPx + 'px' }"
                 class="preview-canvas" @click="onCanvasClick"
                 :class="{ empty: !state.frames }"></canvas>
+        <div class="size-row">
+          <span class="size-lbl">光标大小</span>
+          <button v-for="s in [48, 64, 96]" :key="s" class="size-btn"
+                  :class="{ active: state.canvasSize === s }" :disabled="busy"
+                  @click="setSize(s)">{{ s }}</button>
+        </div>
         <div class="meta-row">
           <span class="tag" v-if="state.frames > 1">动画 {{ state.frames }} 帧</span>
           <span class="tag" v-else-if="state.frames === 1">静态光标</span>
@@ -261,8 +294,8 @@ function quitApp() {
           <span class="tag accent">热点 ({{ state.hotspot[0] }}, {{ state.hotspot[1] }})</span>
         </div>
         <div class="preview-actions">
-          <button class="btn small" :disabled="!state.frames || busy" @click="rotate('ccw')">↺ 逆时针 90°</button>
-          <button class="btn small" :disabled="!state.frames || busy" @click="rotate('cw')">↻ 顺时针 90°</button>
+          <button class="btn small" :disabled="!state.frames || busy" @click="rotate('ccw')">↺ 90°</button>
+          <button class="btn small" :disabled="!state.frames || busy" @click="rotate('cw')">↻ 90°</button>
         </div>
       </section>
 
