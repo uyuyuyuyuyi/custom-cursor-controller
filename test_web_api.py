@@ -66,6 +66,10 @@ def main():
     check("previews 有 2 张", len(up.get("previews", [])) == 2)
     check("hotspot 已给出", isinstance(up.get("hotspot"), list) and len(up["hotspot"]) == 2)
 
+    # 2b. /api/previews 可恢复读取
+    _, pv = req("GET", url + "/api/previews")
+    check("previews 接口返回 2 张", len(pv.get("previews", [])) == 2)
+
     # 3. 启用（真实替换系统光标！）
     _, ap = req("POST", url + "/api/apply")
     check("apply 后 enabled=True", ap["enabled"] is True)

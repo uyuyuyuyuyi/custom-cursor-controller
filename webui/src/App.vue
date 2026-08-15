@@ -47,11 +47,20 @@ async function api(path, opts = {}) {
 
 // ── 初始状态 ──────────────────────────────────────────
 onMounted(async () => {
+  // 前端运行时错误显示到界面（便于排查）
+  window.addEventListener('error', (e) => {
+    error.value = `前端错误: ${e.message}`
+  })
   try {
     const s = await api('/api/state')
     Object.assign(state, s)
-    animIndex.value = 0
-    startAnim()
+    if (s.frames > 0) {
+      // 恢复上次的图片预览（服务端暂存的帧）
+      const p = await api('/api/previews')
+      state.previews = p.previews
+      animIndex.value = 0
+      startAnim()
+    }
   } catch (e) {
     error.value = `无法连接后端服务: ${e.message}`
   }
@@ -136,7 +145,8 @@ async function toggle() {
 }
 
 // ── 热点 ──────────────────────────────────────────────
-const PREVIEW_SCALE = 4
+const CANVAS_SIZE = 48          // 光标画布逻辑尺寸（与服务端一致）
+const PREVIEW_SCALE = 4         // 预览放大倍率（画布实际 192×192）
 const canvasRef = ref(null)
 function onCanvasClick(e) {
   const c = canvasRef.value
@@ -150,42 +160,45 @@ function onCanvasClick(e) {
     .catch(e => { error.value = `热点更新失败: ${e.message}` })
 }
 
-// 绘制预览画布（棋盘格 + 当前帧 + 热点十字）
+// 绘制预览画布（棋盘格 + 当前帧 + 热点十字，全部按画布真实尺寸 192×192）
 function drawPreview() {
   const c = canvasRef.value
   if (!c) return
   const ctx = c.getContext('2d')
-  const S = 48
+  const CS = CANVAS_SIZE * PREVIEW_SCALE   // 192
   ctx.clearRect(0, 0, c.width, c.height)
-  // 棋盘格
-  const cell = 6
-  for (let y = 0; y < S; y += cell)
-    for (let x = 0; x < S; x += cell) {
+  // 棋盘格铺满整个画布
+  const cell = 12
+  for (let y = 0; y < CS; y += cell)
+    for (let x = 0; x < CS; x += cell) {
       ctx.fillStyle = ((x / cell + y / cell) % 2 === 0) ? '#e8e8e8' : '#ffffff'
       ctx.fillRect(x, y, cell, cell)
     }
-  // 图案（最近邻放大，保持像素锐利）
+  // 图案（服务端已按 4 倍放大到 192×192，直接 1:1 绘制，保持像素锐利）
   if (currentPreview.value) {
     const img = new Image()
     img.onload = () => {
       ctx.imageSmoothingEnabled = false
-      ctx.drawImage(img, 0, 0, S, S)
-      drawHotspot(ctx, S)
+      ctx.drawImage(img, 0, 0, CS, CS)
+      drawHotspot(ctx, CS)
     }
     img.src = currentPreview.value
   } else {
-    drawHotspot(ctx, S)
+    drawHotspot(ctx, CS)
   }
 }
-function drawHotspot(ctx, S) {
+function drawHotspot(ctx, CS) {
   const [hx, hy] = state.hotspot
+  const px = hx * PREVIEW_SCALE
+  const py = hy * PREVIEW_SCALE
+  const half = 4 * PREVIEW_SCALE
   ctx.strokeStyle = '#ff3030'
   ctx.lineWidth = 1.2
   ctx.beginPath()
-  ctx.moveTo(hx - 4, hy); ctx.lineTo(hx + 4, hy)
-  ctx.moveTo(hx, hy - 4); ctx.lineTo(hx, hy + 4)
+  ctx.moveTo(px - half, py); ctx.lineTo(px + half, py)
+  ctx.moveTo(px, py - half); ctx.lineTo(px, py + half)
   ctx.stroke()
-  ctx.beginPath(); ctx.arc(hx, hy, 2, 0, Math.PI * 2); ctx.stroke()
+  ctx.beginPath(); ctx.arc(px, py, 3 * PREVIEW_SCALE, 0, Math.PI * 2); ctx.stroke()
 }
 watch([currentPreview, () => state.hotspot.join(',')], drawPreview, { flush: 'post' })
 
@@ -218,7 +231,7 @@ function quitApp() {
       <!-- 左列: 预览 -->
       <section class="card preview-card">
         <h2>预览 <small>点击画面设置热点（点击点位置）</small></h2>
-        <canvas ref="canvasRef" :width="48 * PREVIEW_SCALE" :height="48 * PREVIEW_SCALE"
+        <canvas ref="canvasRef" :width="CANVAS_SIZE * PREVIEW_SCALE" :height="CANVAS_SIZE * PREVIEW_SCALE"
                 class="preview-canvas" @click="onCanvasClick"
                 :class="{ empty: !state.frames }"></canvas>
         <div class="meta-row">

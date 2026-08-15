@@ -100,12 +100,7 @@ class CursorApp:
             self.src_size = (processed[0][0].width, processed[0][0].height)
 
         # 预览: 每帧 4x 放大 PNG → base64
-        previews = []
-        for f in frames:
-            big = f.resize((CANVAS_SIZE * 4, CANVAS_SIZE * 4), Image.NEAREST)
-            buf = io.BytesIO()
-            big.save(buf, format="PNG")
-            previews.append("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+        previews = self.previews()
 
         hard_reject = any(
             it.level == "error" and it.code in HARD_REJECT_CODES for it in worst.issues
@@ -121,6 +116,18 @@ class CursorApp:
             "previews": previews,
             "hard_reject": hard_reject,
         }
+
+    def previews(self) -> list[str]:
+        """当前暂存帧的 base64 预览（每帧 4x 放大 PNG）。"""
+        with self.lock:
+            out = []
+            for f in self.frames:
+                big = f.resize((CANVAS_SIZE * 4, CANVAS_SIZE * 4), Image.NEAREST)
+                buf = io.BytesIO()
+                big.save(buf, format="PNG")
+                out.append("data:image/png;base64,"
+                           + base64.b64encode(buf.getvalue()).decode())
+            return out
 
     @staticmethod
     def _fit_to_canvas(img: Image.Image, size: int) -> Image.Image:
@@ -235,6 +242,9 @@ def make_handler(app: CursorApp, webui_dir: str | None):
             path = urlparse(self.path).path
             if path == "/api/state":
                 self._send_json(app.state())
+                return
+            if path == "/api/previews":
+                self._send_json({"previews": app.previews()})
                 return
             if path.startswith("/api/"):
                 self._send_error(404, f"未知接口: {path}")

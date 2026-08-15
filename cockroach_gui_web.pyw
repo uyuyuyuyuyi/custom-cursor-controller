@@ -18,15 +18,37 @@ import webview
 import gui_server
 from gui_server import CursorApp, start_server
 
+# 兼容 Windows GBK 控制台（调试输出用）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 SMOKE_SECONDS = 6
 
 
 def main() -> None:
     smoke = "--smoke" in sys.argv
+    demo = "--demo" in sys.argv
+    verify = "--verify" in sys.argv
 
     app = CursorApp()
     server = start_server(app)
     url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    # --demo: 启动前注入一张测试图，供可视化验证预览渲染
+    if demo:
+        import io
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (48, 48), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.polygon([(6, 40), (6, 14), (18, 14), (24, 4), (30, 14), (42, 14), (42, 40)],
+                  fill=(255, 255, 255, 255))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        r = app.upload([("demo.png", buf.getvalue())])
+        print("DEMO_UPLOADED frames=%s verdict=%s" % (r["frames"], r["verdict"]), flush=True)
 
     window = webview.create_window(
         "自定义光标控制器 · Custom Cursor Controller",
@@ -129,8 +151,48 @@ def main() -> None:
     window.events.closing += on_closing
 
     def after_start():
+        if verify:
+            # 探针: 采样画布像素，验证预览是否铺满整个画布
+            probe_js = """(function(){
+                var c = document.querySelector('canvas');
+                if (!c) return 'NO_CANVAS';
+                var ctx = c.getContext('2d');
+                function px(x, y) {
+                    var d = ctx.getImageData(x, y, 1, 1).data;
+                    return [d[0], d[1], d[2], d[3]];
+                }
+                return JSON.stringify({
+                    canvasW: c.width, canvasH: c.height,
+                    far_bottom_right: px(160, 160),
+                    near_top_left: px(16, 16),
+                    center: px(96, 96),
+                    hotspot_area: px(96, 88),
+                    errorBanner: !!document.querySelector('.error-banner'),
+                    verdictBadge: !!document.querySelector('.verdict-badge'),
+                    metaTags: document.querySelectorAll('.tag').length,
+                    bodySnippet: document.body.innerText.slice(0, 200)
+                });
+            })()"""
+
+            def on_result(result):
+                print("PROBE_RESULT:", result, flush=True)
+
+            def probe():
+                try:
+                    result = window.evaluate_js(probe_js, callback=on_result)
+                    if result is not None:
+                        print("PROBE_DIRECT:", result, flush=True)
+                except Exception as e:
+                    print("PROBE_ERROR:", e, flush=True)
+
+            # 页面加载完成后 5 秒再探测（确保前端已拉取状态并完成绘制）
+            threading.Timer(5.0, probe).start()
+
         if smoke:
-            threading.Timer(SMOKE_SECONDS, on_quit).start()
+            print("SMOKE_STARTED", flush=True)
+            # demo 模式给截图/探针留时间
+            seconds = 25 if demo else SMOKE_SECONDS
+            threading.Timer(seconds, on_quit).start()
 
     atexit.register(app.cleanup)
     webview.start(after_start)
