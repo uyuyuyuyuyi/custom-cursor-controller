@@ -854,6 +854,7 @@ class CursorApp:
                 )
             if self.enabled:
                 self.mgr.replace_cursor(self._rebuild_ani())
+                self.mgr.set_cursor_size(size)
             return {
                 "canvas_size": size,
                 "hotspot": list(self.hotspot),
@@ -930,12 +931,15 @@ class CursorApp:
                 raise ValueError("还没有可用图片，请先上传")
             ani_path = self._rebuild_ani()
             self.mgr.replace_cursor(ani_path)
+            # 屏幕实际显示尺寸由 CursorBaseSize 决定, 同步画布尺寸才可见
+            self.mgr.set_cursor_size(self.canvas_size)
             self.enabled = True
             return True
 
     def restore(self) -> bool:
         with self.lock:
             self.mgr.restore_original()
+            self.mgr.restore_cursor_size()
             self.enabled = False
             return False
 
@@ -1015,6 +1019,7 @@ class CursorApp:
             self.removal_diagnostics = None
             self.last_cursor_id = cid
             self.mgr.replace_cursor(ani_path)
+            self.mgr.set_cursor_size(self.canvas_size)
             self.enabled = True
             return {"enabled": True, "name": entry["name"], "cid": cid,
                     "canvas_size": self.canvas_size,
@@ -1068,6 +1073,7 @@ class CursorApp:
                 self._reset_work_state()
                 if was_enabled:
                     self.mgr.restore_original()
+                    self.mgr.restore_cursor_size()
                 result["restored"] = was_enabled
             else:
                 result["restored"] = False
@@ -1089,10 +1095,11 @@ class CursorApp:
         self.last_cursor_id = None
 
     def cleanup(self) -> None:
-        """退出时恢复光标并释放资源。"""
+        """退出时恢复光标与指针尺寸并释放资源。"""
         try:
             if self.enabled:
                 self.mgr.restore_original()
+            self.mgr.restore_cursor_size()
         except Exception:
             try:
                 self.mgr.reload_system_defaults()

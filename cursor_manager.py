@@ -9,6 +9,7 @@ cursor_manager.py — Win32 系统光标管理（备份 / 替换 / 恢复）
 from __future__ import annotations
 
 import ctypes
+import winreg
 from ctypes import wintypes
 
 # ── Windows API 常量 ───────────────────────────────────
@@ -17,6 +18,15 @@ IMAGE_CURSOR = 2
 LR_COPYFROMRESOURCE = 0x00004000
 SPI_SETCURSORS = 0x0057
 SPIF_SENDCHANGE = 0x0002
+
+# ── 指针基础尺寸 (CursorBaseSize) ───────────────────────
+# Windows 显示系统光标 (含 SetSystemCursor 替换的箭头) 时, 实际尺寸由
+# HKCU\Control Panel\Cursors\CursorBaseSize 决定 (系统"鼠标指针大小"
+# 辅助功能设置), .ani 帧分辨率只影响清晰度。要让画布 48/64/96 真正改变
+# 屏幕上的显示大小, 必须同步该值, 并在恢复/退出时还原用户原值。
+CURSORS_KEY = r"Control Panel\Cursors"
+CURSOR_BASE_SIZE_NAME = "CursorBaseSize"
+DEFAULT_BASE_SIZE = 32
 
 # ── ctypes 绑定 ───────────────────────────────────────
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -67,6 +77,29 @@ def _check(ok: bool, msg: str) -> None:
         raise ctypes.WinError(err, msg)
 
 
+def _read_cursor_base_size() -> int:
+    """读取系统指针基础尺寸；注册表无值时按 Windows 默认 32。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CURSORS_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, CURSOR_BASE_SIZE_NAME)
+        return int(value)
+    except OSError:
+        return DEFAULT_BASE_SIZE
+
+
+def _write_cursor_base_size(size: int) -> None:
+    """写入系统指针基础尺寸（DWORD, 单位: 96 DPI 下的像素）。"""
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CURSORS_KEY) as key:
+        winreg.SetValueEx(key, CURSOR_BASE_SIZE_NAME, 0, winreg.REG_DWORD, int(size))
+
+
+def _broadcast_cursors() -> None:
+    """广播 SPI_SETCURSORS, 让所有窗口按新设置重新渲染光标。"""
+    ok = user32.SystemParametersInfoW(SPI_SETCURSORS, 0, None, SPIF_SENDCHANGE)
+    if not ok:
+        raise ctypes.WinError(kernel32.GetLastError(), "SPI_SETCURSORS 广播失败")
+
+
 # ── 光标管理 ──────────────────────────────────────────
 
 class CursorManager:
@@ -74,6 +107,7 @@ class CursorManager:
 
     def __init__(self):
         self._saved_original: int | None = None  # 原始箭头光标备份句柄
+        self._saved_base_size: int | None = None  # 应用前的指针基础尺寸
 
     def backup_original(self) -> None:
         """备份当前系统箭头光标句柄（供后续恢复）。
@@ -142,6 +176,35 @@ class CursorManager:
         if not ok:
             raise ctypes.WinError(
                 kernel32.GetLastError(), "SPI_SETCURSORS 广播失败")
+
+    def set_cursor_size(self, size: int) -> None:
+        """临时把系统指针基础尺寸设为 size（画布尺寸）并广播刷新。
+
+        Windows 按 CursorBaseSize 缩放显示所有系统光标, 因此替换 .ani 后
+        若不写该值, 48/64/96 档位在屏幕上会全部按系统设置 (默认 32) 显示。
+        首次调用时保存用户原值供 restore_cursor_size 还原；应用期间其它
+        系统光标（手型/I 型等）也会同步缩放, 与系统"鼠标指针大小"设置
+        的行为一致。
+        """
+        if self._saved_base_size is None:
+            self._saved_base_size = _read_cursor_base_size()
+        try:
+            _write_cursor_base_size(size)
+            _broadcast_cursors()
+        except OSError:
+            pass  # 注册表/广播失败不阻断光标应用
+
+    def restore_cursor_size(self) -> None:
+        """还原 set_cursor_size 保存的用户指针基础尺寸。"""
+        if self._saved_base_size is None:
+            return
+        saved = self._saved_base_size
+        self._saved_base_size = None
+        try:
+            _write_cursor_base_size(saved)
+            _broadcast_cursors()
+        except OSError:
+            pass
 
     def cleanup(self) -> None:
         """释放备份句柄。"""
