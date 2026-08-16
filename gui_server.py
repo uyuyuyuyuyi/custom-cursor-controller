@@ -853,8 +853,9 @@ class CursorApp:
                     min(size - 1, round(self.hotspot[1] * scale)),
                 )
             if self.enabled:
-                self.mgr.replace_cursor(self._rebuild_ani())
+                # 尺寸广播必须发生在 SetSystemCursor 之前 (见 apply 注释)
                 self.mgr.set_cursor_size(size)
+                self.mgr.replace_cursor(self._rebuild_ani())
             return {
                 "canvas_size": size,
                 "hotspot": list(self.hotspot),
@@ -930,9 +931,11 @@ class CursorApp:
             if not self.frames:
                 raise ValueError("还没有可用图片，请先上传")
             ani_path = self._rebuild_ani()
-            self.mgr.replace_cursor(ani_path)
-            # 屏幕实际显示尺寸由 CursorBaseSize 决定, 同步画布尺寸才可见
+            # 屏幕实际显示尺寸由 CursorBaseSize 决定, 同步画布尺寸才可见。
+            # 注意顺序: 尺寸广播 (SPI_SETCURSORS) 会重载方案, 必须发生在
+            # SetSystemCursor 之前, 否则会把刚替换的光标重置回默认箭头。
             self.mgr.set_cursor_size(self.canvas_size)
+            self.mgr.replace_cursor(ani_path)
             self.enabled = True
             return True
 
@@ -1018,8 +1021,9 @@ class CursorApp:
             self.auto_apply_allowed = True
             self.removal_diagnostics = None
             self.last_cursor_id = cid
-            self.mgr.replace_cursor(ani_path)
+            # 尺寸广播必须发生在 SetSystemCursor 之前 (见 apply 注释)
             self.mgr.set_cursor_size(self.canvas_size)
+            self.mgr.replace_cursor(ani_path)
             self.enabled = True
             return {"enabled": True, "name": entry["name"], "cid": cid,
                     "canvas_size": self.canvas_size,

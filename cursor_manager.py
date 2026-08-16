@@ -185,6 +185,10 @@ class CursorManager:
         首次调用时保存用户原值供 restore_cursor_size 还原；应用期间其它
         系统光标（手型/I 型等）也会同步缩放, 与系统"鼠标指针大小"设置
         的行为一致。
+
+        **必须在 replace_cursor (SetSystemCursor) 之前调用**: SPI_SETCURSORS
+        广播会让系统从注册表重新加载光标方案, 若在 SetSystemCursor 之后
+        广播, 会把刚替换的自定义光标重置回方案默认箭头。
         """
         if self._saved_base_size is None:
             self._saved_base_size = _read_cursor_base_size()
