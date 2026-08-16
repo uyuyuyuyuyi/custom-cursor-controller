@@ -36,6 +36,7 @@ exe = EXE(
     a.datas,
     [],
     name='CustomCursorController',
+    icon='assets/app.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
