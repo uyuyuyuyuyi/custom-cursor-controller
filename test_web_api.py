@@ -428,6 +428,24 @@ def main():
           jiffies2 == [12, 12], str(jiffies2))
     req("POST", url + "/api/restore")
 
+    # 5d3. 旧条目（无 durations 字段）: 从存储 .ani 的 rate 块回退恢复帧时长
+    app.store.index["cursors"][cid_gif].pop("durations", None)
+    app.store._save()
+    _, ga_legacy = req("POST", url + f"/api/gallery/cursors/{cid_gif}/apply")
+    check("旧条目图库应用", ga_legacy["enabled"] is True)
+    req("POST", url + "/api/hotspot",
+        json.dumps({"x": 20, "y": 20}).encode(),
+        {"Content-Type": "application/json"})      # 启用中 → 重建 .ani
+    with open(ani_path, "rb") as f:
+        ani3 = f.read()
+    rate_idx3 = ani3.find(b"rate")
+    rate_size3 = _struct.unpack_from("<I", ani3, rate_idx3 + 4)[0]
+    jiffies3 = list(_struct.unpack_from("<" + "I" * (rate_size3 // 4),
+                                        ani3, rate_idx3 + 8))
+    check("旧条目回退仍保留帧时长 jiffies=[12,12]",
+          jiffies3 == [12, 12], str(jiffies3))
+    req("POST", url + "/api/restore")
+
     # 5e. 真实 GIF（白底动画）: 所有帧背景统一透明（修复白底闪现）
     gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "test_res", "cockroach-dancing.gif")

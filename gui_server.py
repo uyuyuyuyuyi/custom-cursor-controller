@@ -23,6 +23,7 @@ import hashlib
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -568,12 +569,31 @@ class CursorApp:
         }
 
     @staticmethod
-    def _entry_durations(entry: dict, frame_count: int) -> list[int]:
-        """读取图库光标条目保存的逐帧时长；旧条目无此字段时退回默认。"""
+    def _ani_durations_ms(ani_bytes: bytes) -> list[int]:
+        """从 .ani 文件的 rate 块解析逐帧时长（旧图库条目无 durations 时的兜底）。"""
+        idx = ani_bytes.find(b"rate")
+        if idx < 0:
+            return []
+        size = struct.unpack_from("<I", ani_bytes, idx + 4)[0]
+        jiffies = struct.unpack_from("<" + "I" * (size // 4), ani_bytes, idx + 8)
+        return [max(20, min(2000, round(j * 1000 / 60))) for j in jiffies]
+
+    @staticmethod
+    def _entry_durations(entry: dict, frame_count: int,
+                         ani_bytes: bytes | None = None) -> list[int]:
+        """读取图库光标条目的逐帧时长。
+
+        优先条目里保存的 durations；旧条目无此字段时从存储的 .ani 的
+        rate 块解析（其中包含创建时的正确帧时长）；仍失败才退回默认。
+        """
         stored = entry.get("durations")
         if (isinstance(stored, list) and len(stored) == frame_count
                 and all(isinstance(v, int) for v in stored)):
             return [max(20, min(2000, v)) for v in stored]
+        if ani_bytes is not None:
+            parsed = CursorApp._ani_durations_ms(ani_bytes)
+            if len(parsed) == frame_count:
+                return parsed
         return [FRAME_MS] * frame_count
 
     def upload(self, file_items: list[tuple[str, bytes]]) -> dict:
@@ -730,7 +750,13 @@ class CursorApp:
                 self.frames = frames
                 self.canvas_size = existing["size"]
                 self.hotspot = tuple(existing["hotspot"])
-                self.durations = self._entry_durations(existing, len(frames))
+                ani_path = self.store.cursor_ani_path(existing["id"])
+                ani_bytes = None
+                if ani_path and os.path.isfile(ani_path):
+                    with open(ani_path, "rb") as f:
+                        ani_bytes = f.read()
+                self.durations = self._entry_durations(
+                    existing, len(frames), ani_bytes)
                 self.src_size = (frames[0].width, frames[0].height)
                 self.verdict = self.score = None
                 self.issues = []
@@ -1015,10 +1041,12 @@ class CursorApp:
             frames = self.store.cursor_frames(cid)
             if not ani_path or not frames:
                 raise ValueError("光标文件缺失")
+            with open(ani_path, "rb") as f:
+                ani_bytes = f.read()
             self.frames = frames
             self.canvas_size = entry["size"]
             self.hotspot = tuple(entry["hotspot"])
-            self.durations = self._entry_durations(entry, len(frames))
+            self.durations = self._entry_durations(entry, len(frames), ani_bytes)
             self.src_size = (frames[0].width, frames[0].height)
             self.verdict = self.score = None
             self.issues = []
