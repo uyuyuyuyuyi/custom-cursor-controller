@@ -84,6 +84,50 @@ def make_gif(duration_ms=200):
                    disposal=2, transparency=0)
     return buf.getvalue()
 
+def make_blue_id_photo():
+    """蓝底证件照风格（回归: 彩色背景+照明渐变必须去除, 肤色/阴影皮肤必须保留）。
+
+    结构: 240x240 RGB。蓝底径向渐变 (边缘深蓝灰 → 中心亮蓝); 肤色脸(高饱和)
+    + 脸右侧阴影皮肤块(低饱和暖色) + 头顶深色头发。
+    """
+    img = Image.new("RGB", (240, 240))
+    px = img.load()
+    for y in range(240):
+        for x in range(240):
+            dx = (x - 120) / 120.0
+            dy = (y - 120) / 90.0
+            t = min(1.0, (dx * dx + dy * dy) ** 0.5)
+            px[x, y] = (round(140 - 51 * t), round(206 - 77 * t), round(249 - 88 * t))
+    d = ImageDraw.Draw(img)
+    d.ellipse((86, 96, 158, 190), fill=(232, 190, 160, 255))   # 肤色脸
+    d.ellipse((140, 120, 168, 178), fill=(180, 145, 140, 255)) # 脸右侧阴影皮肤
+    d.rectangle((96, 84, 148, 98), fill=(50, 45, 55, 255))     # 头发
+    return img
+
+def make_shadow_plane():
+    """白底 + 明显阴影 + 彩色主体（回归: 阴影背景必须整体去除）。
+
+    结构: 160x160 RGB, 顶部白(255)到底部浅灰(120)的垂直渐变模拟大面积阴影;
+    左上角白色高光块(硬边界); 主体为高饱和橙色椭圆(蟑螂体) + 深棕腿;
+    主体下方一块中灰深阴影(连到渐变背景, 属于背景)。
+    """
+    img = Image.new("RGB", (160, 160))
+    px = img.load()
+    for y in range(160):
+        g = 255 - int(135 * y / 159)
+        for x in range(160):
+            px[x, y] = (g, g, g)
+    d = ImageDraw.Draw(img)
+    d.ellipse((10, 0, 80, 45), fill=(255, 255, 255, 255))   # 白色高光(触顶边)
+    d.ellipse((50, 40, 110, 104), fill=(195, 103, 18, 255)) # 橙色主体
+    for i in range(24):                                     # 主体下方深阴影(渐隐)
+        shade = 150 - i * 3
+        d.ellipse((52 - i // 2, 104, 108 + i // 2, 104 + i * 2),
+                  fill=(shade, shade, shade, 255))
+    d.rectangle((54, 104, 62, 124), fill=(80, 40, 20, 255)) # 深棕腿(画在阴影之上)
+    d.rectangle((98, 104, 106, 124), fill=(80, 40, 20, 255))
+    return img
+
 def main():
     store_root = (os.environ.get("CCC_TEST_ROOT")
                   or tempfile.mkdtemp(prefix="custom_cursor_test_"))
@@ -101,6 +145,9 @@ def main():
     # 2. 上传两张箭头（动画）
     _, up = upload(url, [make_arrow(), make_arrow((255, 200, 60, 255))])
     check("上传成功 frames=2", up["frames"] == 2, f"verdict={up['verdict']} score={up['score']}")
+    check("干净透明图允许自动应用", up.get("auto_apply") is True
+          and up.get("removal_confidence") == "high",
+          f"confidence={up.get('removal_confidence')}")
     check("previews 有 2 张", len(up.get("previews", [])) == 2)
     check("hotspot 已给出", isinstance(up.get("hotspot"), list) and len(up["hotspot"]) == 2)
     check("上传返回光标 id/名称", up.get("cursor_id") and up.get("cursor_name"),
@@ -357,6 +404,9 @@ def main():
         _, rg = upload(url, [real_gif])
         check("真实 GIF 提取多帧", rg["frames"] > 1,
               f"frames={rg['frames']} verdict={rg['verdict']} score={rg['score']}")
+        check("真实 GIF 抠图高置信且可自动应用",
+              rg.get("removal_confidence") == "high" and rg.get("auto_apply") is True,
+              f"confidence={rg.get('removal_confidence')} auto={rg.get('auto_apply')}")
         corners_ok = True
         worst_corner = 255
         for pv in rg["previews"]:
@@ -376,6 +426,48 @@ def main():
     _, bad = upload(url, [make_blank()])
     check("空白图判不适合", bad["verdict"] == "不适合", f"score={bad['score']}")
     check("空白图 hard_reject=True", bad.get("hard_reject") is True)
+
+    # 6b. 白底+阴影照片 (回归: 白色带阴影的平面必须整体识别为背景)
+    buf = io.BytesIO()
+    make_shadow_plane().save(buf, format="PNG")
+    _, sp = upload(url, [buf.getvalue()])
+    check("阴影图非硬拒绝", sp.get("hard_reject") is False,
+          f"verdict={sp.get('verdict')} score={sp.get('score')} issues={sp.get('issues')}")
+    # 预览为 4 倍放大: 检查四角透明 / 主体中心不透明 / 主体下方深阴影处透明
+    cs = sp["canvas_size"]                      # 此时画布可能不是 64 (前面测试切过尺寸)
+    body_pos = (round(80 * cs / 160), round(72 * cs / 160))      # 源坐标 (80,72)
+    shadow_pos = (round(80 * cs / 160), round(115 * cs / 160))   # 源坐标 (80,115)
+    pv_img = Image.open(io.BytesIO(base64.b64decode(
+        sp["previews"][0].split(",", 1)[1]))).convert("RGBA")
+    corners_ok = all(pv_img.getpixel(c)[3] <= 120 for c in
+                     ((2, 2), (pv_img.width - 3, 2),
+                      (2, pv_img.height - 3), (pv_img.width - 3, pv_img.height - 3)))
+    check("阴影图四角透明（背景已去除）", corners_ok)
+    body_a = pv_img.getpixel((body_pos[0] * 4 + 2, body_pos[1] * 4 + 2))[3]
+    check("阴影图主体保留", body_a > 200, f"center_alpha={body_a}")
+    shadow_a = pv_img.getpixel((shadow_pos[0] * 4 + 2, shadow_pos[1] * 4 + 2))[3]
+    check("阴影图主体下方深阴影已去除", shadow_a <= 120, f"shadow_alpha={shadow_a}")
+
+    # 6c. 蓝底证件照 (回归: 彩色背景+渐变必须去除, 肤色/阴影皮肤必须保留)
+    buf = io.BytesIO()
+    make_blue_id_photo().save(buf, format="PNG")
+    _, bp = upload(url, [buf.getvalue()])
+    check("证件照非硬拒绝", bp.get("hard_reject") is False,
+          f"verdict={bp.get('verdict')} score={bp.get('score')}")
+    cs = bp["canvas_size"]
+    bp_img = Image.open(io.BytesIO(base64.b64decode(
+        bp["previews"][0].split(",", 1)[1]))).convert("RGBA")
+    face_a = bp_img.getpixel((round(122 * cs / 240) * 4 + 2,
+                              round(143 * cs / 240) * 4 + 2))[3]
+    check("证件照脸部保留", face_a > 200, f"face_alpha={face_a}")
+    shade_a = bp_img.getpixel((round(152 * cs / 240) * 4 + 2,
+                               round(148 * cs / 240) * 4 + 2))[3]
+    check("证件照阴影皮肤保留", shade_a > 200, f"shade_alpha={shade_a}")
+    blue_a = bp_img.getpixel((round(30 * cs / 240) * 4 + 2,
+                              round(120 * cs / 240) * 4 + 2))[3]
+    check("证件照蓝底已去除", blue_a <= 120, f"blue_alpha={blue_a}")
+    corner_a = bp_img.getpixel((2, 2))[3]
+    check("证件照深色条带已去除", corner_a <= 120, f"corner_alpha={corner_a}")
 
     # 7. 关联删除 & 图库生成光标
     def upload_one(color):
