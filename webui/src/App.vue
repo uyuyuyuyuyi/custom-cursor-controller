@@ -10,6 +10,8 @@ const state = reactive({
   verdict: null,        // 适合 | 有风险 | 不适合
   score: null,
   issues: [],
+  removalConfidence: null,
+  autoApply: false,
   previews: [],         // base64 PNG 列表（每帧一张）
   srcSize: null,
   dataDir: '',
@@ -89,6 +91,8 @@ async function refreshState() {
   state.verdict = s.verdict
   state.score = s.score
   state.issues = s.issues
+  state.removalConfidence = s.removal_confidence || null
+  state.autoApply = s.auto_apply === true
   state.srcSize = s.src_size
   state.dataDir = s.data_dir || ''
   if (s.frames > 0) {
@@ -140,6 +144,8 @@ async function doUpload(fileList) {
     state.verdict = r.verdict
     state.score = r.score
     state.issues = r.issues
+    state.removalConfidence = r.removal_confidence || null
+    state.autoApply = r.auto_apply === true
     state.dataDir = r.data_dir || state.dataDir
     animIndex.value = 0
     startAnim()
@@ -147,19 +153,26 @@ async function doUpload(fileList) {
 
     const applyAndNotify = async () => {
       await apply()
-      showToast(`已自动替换为新光标「${r.cursor_name}」`)
+      showToast(`已替换为新光标「${r.cursor_name}」`)
     }
 
     const verdictFlow = () => {
+      confirm.action2 = null
+      confirm.action2Label = ''
+      confirm.actionLabel = '仍然应用'
       if (r.verdict === '不适合') {
         confirm.title = '图片不适合做光标'
         confirm.body = r.issues.map(i => `• ${i.message}`)
         confirm.action = r.hard_reject ? null : applyAndNotify
         confirm.cancelAction = null
         confirm.show = true
-      } else if (r.verdict === '有风险') {
-        confirm.title = '图片可能不适合'
-        confirm.body = r.issues.map(i => `• ${i.message}`)
+      } else if (r.verdict === '有风险' || r.auto_apply !== true) {
+        confirm.title = r.removal_confidence === 'low'
+          ? '自动抠图可信度较低'
+          : '请确认抠图结果'
+        confirm.body = r.issues.length
+          ? r.issues.map(i => `• ${i.message}`)
+          : ['• 系统未能确认主体是否完整，因此没有自动应用。']
         confirm.action = applyAndNotify
         confirm.cancelAction = null
         confirm.show = true
@@ -358,6 +371,8 @@ async function applyCursor(c) {
     state.frames = r.frames
     state.verdict = null
     state.issues = []
+    state.removalConfidence = 'high'
+    state.autoApply = true
     animIndex.value = 0
     startAnim()
     showToast(`已应用光标「${r.name}」`)
@@ -495,6 +510,8 @@ async function generateFromUpload(u) {
     state.verdict = r.verdict
     state.score = r.score
     state.issues = r.issues
+    state.removalConfidence = r.removal_confidence || null
+    state.autoApply = r.auto_apply === true
     state.dataDir = r.data_dir || state.dataDir
     animIndex.value = 0
     startAnim()
@@ -509,12 +526,17 @@ async function generateFromUpload(u) {
         ? `已应用相同内容的光标「${r.cursor_name}」`
         : `已生成光标「${r.cursor_name}」并应用`)
     }
-    if (r.verdict === '不适合' || r.verdict === '有风险') {
-      confirm.title = r.verdict === '不适合' ? '图片不适合做光标' : '图片可能不适合'
-      confirm.body = r.issues.map(i => `• ${i.message}`)
+    if (r.verdict === '不适合' || r.verdict === '有风险' || r.auto_apply !== true) {
+      confirm.title = r.verdict === '不适合'
+        ? '图片不适合做光标'
+        : r.removal_confidence === 'low' ? '自动抠图可信度较低' : '请确认抠图结果'
+      confirm.body = r.issues.length
+        ? r.issues.map(i => `• ${i.message}`)
+        : ['• 系统未能确认主体是否完整，因此没有自动应用。']
       confirm.action = applyAndNotify
       confirm.action2 = null
       confirm.action2Label = ''
+      confirm.actionLabel = '仍然应用'
       confirm.cancelAction = null
       confirm.show = true
     } else {
@@ -605,6 +627,9 @@ function quitApp() {
                    :style="{ width: (state.score || 0) + '%' }"></div>
             </div>
             <span class="score-num">{{ state.score }}/100</span>
+            <span class="score-num" v-if="state.removalConfidence">
+              抠图{{ state.removalConfidence === 'high' ? '高可信' : state.removalConfidence === 'medium' ? '需确认' : '低可信' }}
+            </span>
           </div>
           <ul class="issue-list">
             <li v-for="(it, i) in state.issues" :key="i" :class="it.level">
