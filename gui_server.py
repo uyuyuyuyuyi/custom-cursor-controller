@@ -30,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter
 
 from ani_builder import build_ani_file, save_ani_file
 from pointer_analyzer import (
@@ -58,6 +58,56 @@ def _resize_rgba_premultiplied(
         return rgba.copy()
     # Pillow 的 RGBa 是预乘 alpha 模式；缩放后转回直 alpha 的 RGBA。
     return rgba.convert("RGBa").resize(size, resample).convert("RGBA")
+
+
+CROP_MARGIN = 0.06        # 第二阶段: alpha bbox 向外留 6% 边距（主体自动裁剪）
+CROP_FILL_RATIO = 0.75    # 主体较大边已占画布较大边 75% 时不裁剪（基本铺满的图标
+                          # 裁剪收益小, 且会改变旋转/热点的既有布局预期）
+
+
+def _feather_alpha_additive(img: Image.Image, radius: float) -> Image.Image:
+    """最终尺寸受控羽化: 预乘 alpha 高斯模糊后, alpha 只增不减 (max)。
+
+    模糊在预乘空间进行, 半透明像素的 RGB 随 alpha 一起带出主体颜色,
+    不会出现黑边/白边; alpha 取 max(原值, 模糊值) 保证细腿/触角等
+    1px 特征不会被模糊减弱。
+    """
+    if radius <= 0:
+        return img.copy()
+    rgba = img.convert("RGBA")
+    blurred = (rgba.convert("RGBa")
+               .filter(ImageFilter.GaussianBlur(radius))
+               .convert("RGBA"))
+    out = blurred.copy()
+    out.putalpha(ImageChops.lighter(rgba.getchannel("A"),
+                                    blurred.getchannel("A")))
+    return out
+
+
+def _subject_crop_box(frames: list[Image.Image]) -> tuple[int, int, int, int] | None:
+    """多帧联合 alpha bbox + 边距（GIF 用联合框避免动画跳动）。
+
+    主体已铺满画布 CROP_FILL_RATIO 时不裁剪。
+    """
+    boxes = []
+    for frame in frames:
+        bbox = frame.getchannel("A").point(
+            lambda a: 255 if a > 32 else 0).getbbox()
+        if bbox:
+            boxes.append(bbox)
+    if not boxes:
+        return None
+    left = min(b[0] for b in boxes)
+    top = min(b[1] for b in boxes)
+    right = max(b[2] for b in boxes)
+    bottom = max(b[3] for b in boxes)
+    fw, fh = frames[0].size
+    if max(right - left, bottom - top) >= CROP_FILL_RATIO * max(fw, fh):
+        return None
+    mx = max(1, round((right - left) * CROP_MARGIN))
+    my = max(1, round((bottom - top) * CROP_MARGIN))
+    return (max(0, left - mx), max(0, top - my),
+            min(fw, right + mx), min(fh, bottom + my))
 
 
 # 静态前端目录: 源码运行时在 webui/dist，打包后在 _MEIPASS/webui
@@ -522,11 +572,12 @@ class CursorApp:
          removal_diags) = self._process_files(file_items)
         quality = self._quality_summary(worst, removal_diags)
 
-        # 统一缩放到画布尺寸
-        frames = []
-        for img, _bg in processed:
-            canvas = self._fit_to_canvas(img, self.canvas_size)
-            frames.append(canvas)
+        # 统一缩放到画布尺寸（第二阶段: 先按多帧联合 alpha bbox 裁剪+边距,
+        # 让主体尽量占满光标; GIF 用联合框避免动画跳动）
+        source_frames = [img for img, _bg in processed]
+        crop_box = _subject_crop_box(source_frames)
+        frames = [self._fit_to_canvas(img, self.canvas_size, crop_box)
+                  for img in source_frames]
 
         with self.lock:
             self.frames = frames
@@ -615,6 +666,7 @@ class CursorApp:
             "auto_apply": quality["auto_apply"],
             "removal_diagnostics": quality["removal_diagnostics"],
             "src_size": list(self.src_size),
+            "crop_box": list(crop_box) if crop_box else None,
             "previews": previews,
             "hard_reject": hard_reject,
             "cursor_id": c_entry["id"],
@@ -699,8 +751,11 @@ class CursorApp:
          removal_diags) = self._process_files([(entry["original"], data)])
         quality = self._quality_summary(worst, removal_diags)
 
-        # 统一缩放到画布尺寸
-        frames = [self._fit_to_canvas(img, self.canvas_size) for img, _bg in processed]
+        # 统一缩放到画布尺寸（第二阶段: 多帧联合 alpha bbox 裁剪 + 边距）
+        source_frames = [img for img, _bg in processed]
+        crop_box = _subject_crop_box(source_frames)
+        frames = [self._fit_to_canvas(img, self.canvas_size, crop_box)
+                  for img in source_frames]
 
         with self.lock:
             self.frames = frames
@@ -758,6 +813,7 @@ class CursorApp:
             "auto_apply": quality["auto_apply"],
             "removal_diagnostics": quality["removal_diagnostics"],
             "src_size": list(self.src_size),
+            "crop_box": list(crop_box) if crop_box else None,
             "previews": self.previews(),
             "hard_reject": hard_reject,
             "cursor_id": c_entry["id"],
@@ -833,8 +889,12 @@ class CursorApp:
             }
 
     @staticmethod
-    def _fit_to_canvas(img: Image.Image, size: int) -> Image.Image:
-        scale = min(size / img.width, size / img.height, 1.0)
+    def _fit_to_canvas(img: Image.Image, size: int, crop_box=None) -> Image.Image:
+        if crop_box is not None:
+            img = img.crop(crop_box)
+        scale = min(size / img.width, size / img.height)
+        if crop_box is None:
+            scale = min(scale, 1.0)   # 未裁剪时保持"小图不放大"
         new_w = max(1, round(img.width * scale))
         new_h = max(1, round(img.height * scale))
         scaled = _resize_rgba_premultiplied(img, (new_w, new_h))
@@ -842,7 +902,9 @@ class CursorApp:
         # paste(..., mask=scaled) 会把半透明边缘的 alpha 再乘一次；alpha_composite
         # 只应用一次源 alpha，避免细腿/毛发在最终 48/64/96px 画布上继续变淡。
         canvas.alpha_composite(scaled, dest=((size - new_w) // 2, (size - new_h) // 2))
-        return canvas
+        # 最终尺寸受控羽化: 48→0.5px, 64→0.75px, 96→1px（预乘 + max, 不减弱细部）
+        radius = 0.5 if size <= 48 else 0.75 if size <= 64 else 1.0
+        return _feather_alpha_additive(canvas, radius)
 
     # ── 生成 / 应用 / 恢复 ─────────────────────────────
     def _rebuild_ani(self) -> str:
