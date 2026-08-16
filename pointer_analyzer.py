@@ -7,7 +7,7 @@ pointer_analyzer.py — 图片"适不适合做光标"的分析 + 背景自动去
 
 检查维度:
   1. 空白 / 全透明            -> 硬性拒绝
-  2. 无透明通道的背景         -> 自动抠背景（洪水填充去除与边框相近的纯色；
+  2. 无透明通道的背景         -> 自动抠背景（洪水填充去除纯色/渐变背景，先做边框背景色聚类）；
                                   支持白色平面 + 阴影的渐变背景：梯度规则沿
                                   平滑渐变穿越阴影，饱和度门槛保护彩色主体，
                                   孤岛填充补掉被主体包围的背景口袋）
@@ -33,8 +33,19 @@ from PIL import Image, ImageChops
 
 # 光标画布尺寸（与 cursor_drawer / make_custom_cursor 保持一致）
 TARGET_SIZE = 48
-# 自动抠背景时的工作尺寸
+# 自动抠背景时的默认工作尺寸（兼容旧调用；实际工作尺寸 = 目标光标尺寸 × WORK_SCALE）
 BG_WORK_SIZE = 160
+
+# ── 第二阶段: 工作尺寸 / 多背景聚类 / 动态容差 / 贴边播种门控 ──
+WORK_SCALE = 4.0          # 工作图边长 ≈ 目标光标尺寸 × 4（48→192, 64→256, 96→384）
+WORK_MAX_SIDE = 512       # 工作图边长上限（更大原图按此等比缩小）
+MAX_BG_CLUSTERS = 3       # 边框背景色聚类上限
+CLUSTER_MIN_RATIO = 0.12  # 簇权重低于该比例则丢弃（视为贴边主体色/噪声）
+CLUSTER_MERGE_DIST = 60.0  # 簇中心距离小于该值则合并为同一背景
+TOL_K = 3.0               # 动态容差: tolerance = 边框距离中位数 + k × MAD
+TOL_MIN = 24.0            # 动态容差下限（白底/JPEG 微噪声仍能整体去除）
+TOL_MAX = 88.0            # 动态容差上限（防止复杂照片被无界放宽）
+SEG_LEN_MIN = 8           # 边缘播种分段的最小长度
 
 # ── 抠背景 (auto_remove_background) 参数 ──────────────
 # 主洪水: 经典规则之外, 允许沿"平滑渐变"穿越阴影/光照/背景色渐变:
@@ -385,6 +396,111 @@ def _edge_strip_mask(px, w: int, h: int) -> list[list[bool]]:
     return mask
 
 
+def _work_dims(w0: int, h0: int, work_side: int) -> tuple[int, int]:
+    """工作图尺寸: 保持原图长宽比, 只缩小不放大。"""
+    scale = min(1.0, work_side / max(w0, h0))
+    return max(1, round(w0 * scale)), max(1, round(h0 * scale))
+
+
+def _d2(c1: tuple, c2: tuple) -> int:
+    """RGB 欧氏距离平方。"""
+    return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2
+            + (c1[2] - c2[2]) ** 2)
+
+
+def _median_color(cells) -> tuple:
+    """按分量和排序取中位色。"""
+    ordered = sorted(cells, key=lambda c: c[0] + c[1] + c[2])
+    return ordered[len(ordered) // 2]
+
+
+def _border_cells(px, w: int, h: int, strip: list[list[bool]]) -> list:
+    """收集边框非条带单元格（由外向内最多约 3 圈 / 400 个）。"""
+    cells: list = []
+    for inner in range(max(1, min(w, h) // 2)):
+        ring = []
+        for x in range(w):
+            if not strip[inner][x]:
+                ring.append(px[x, inner])
+            if not strip[h - 1 - inner][x]:
+                ring.append(px[x, h - 1 - inner])
+        for y in range(h):
+            if not strip[y][inner]:
+                ring.append(px[inner, y])
+            if not strip[y][w - 1 - inner]:
+                ring.append(px[w - 1 - inner, y])
+        cells.extend(ring)
+        if len(cells) >= 400 or (ring and inner >= 2):
+            break
+    return cells
+
+
+def _kmeans_clusters(cells: list, k: int, iters: int = 10):
+    """确定性 k-means（按颜色排序取等距初值），返回 (中心列表, 各簇大小)。"""
+    ordered = sorted(cells, key=lambda c: (c[0], c[1], c[2]))
+    n = len(ordered)
+    centers = [ordered[min(n - 1, int((i + 0.5) * n / k))] for i in range(k)]
+    for _ in range(iters):
+        sums = [[0, 0, 0] for _ in centers]
+        counts = [0] * k
+        for c in cells:
+            best = 0
+            best_d = _d2(c, centers[0])
+            for i in range(1, k):
+                d = _d2(c, centers[i])
+                if d < best_d:
+                    best_d, best = d, i
+            sums[best][0] += c[0]
+            sums[best][1] += c[1]
+            sums[best][2] += c[2]
+            counts[best] += 1
+        updated = [
+            (s[0] // cnt, s[1] // cnt, s[2] // cnt) if cnt else centers[i]
+            for i, (s, cnt) in enumerate(zip(sums, counts))
+        ]
+        if updated == centers:
+            break
+        centers = updated
+    return centers, counts
+
+
+def _estimate_background_clusters(img: Image.Image, work_size: int) -> list[tuple]:
+    """把边框像素聚类为 1~3 个背景色（多背景色聚类）。
+
+    双色/多色背景（白墙+灰地面等）会得到多个簇，洪水可分别从每个簇扩张；
+    过小或与已保留簇过近的簇会被丢弃（视为贴边主体色/噪声）。
+    """
+    w, h = _work_dims(img.width, img.height, work_size)
+    small = img.convert("RGB").resize((w, h), Image.LANCZOS)
+    px = small.load()
+    strip = _edge_strip_mask(px, w, h)
+    cells = _border_cells(px, w, h, strip)
+    if not cells:
+        return [(0, 0, 0)]
+    k = min(MAX_BG_CLUSTERS, len(cells))
+    centers, counts = _kmeans_clusters(cells, k)
+    pairs = sorted(zip(centers, counts), key=lambda p: -p[1])
+    total = sum(counts)
+    kept: list[tuple] = []
+    for center, count in pairs:
+        if count < total * CLUSTER_MIN_RATIO:
+            continue
+        if any(_d2(center, other) <= CLUSTER_MERGE_DIST ** 2 for other in kept):
+            continue
+        kept.append(center)
+    return kept or [pairs[0][0]]
+
+
+def _dynamic_tolerance(cells: list, bgs: list[tuple]) -> float:
+    """从边框噪声估计容差: 边框距离中位数 + k × MAD, 限幅 TOL_MIN~TOL_MAX。"""
+    dists = sorted(min(_d2(c, b) for b in bgs) ** 0.5 for c in cells)
+    med = dists[len(dists) // 2]
+    devs = sorted(abs(d - med) for d in dists)
+    mad = devs[len(devs) // 2]
+    tol = med + TOL_K * mad
+    return min(TOL_MAX, max(TOL_MIN, tol))
+
+
 def estimate_background_color(img: Image.Image, work_size: int = BG_WORK_SIZE) -> tuple[int, int, int]:
     """估计图片边框主色（背景色），供多帧统一抠图使用。
 
@@ -392,7 +508,8 @@ def estimate_background_color(img: Image.Image, work_size: int = BG_WORK_SIZE) -
     大部分是深色条带, 中位色会偏离照片真实背景)。极端情况 (边框全是条带)
     回退到边框内侧一圈单元格。
     """
-    small = img.convert("RGB").resize((work_size, work_size), Image.LANCZOS)
+    w, h = _work_dims(img.width, img.height, work_size)
+    small = img.convert("RGB").resize((w, h), Image.LANCZOS)
     w, h = small.size
     px = small.load()
     strip = _edge_strip_mask(px, w, h)
@@ -420,9 +537,9 @@ def estimate_background_color(img: Image.Image, work_size: int = BG_WORK_SIZE) -
 
 def auto_remove_background(
     img: Image.Image,
-    tolerance: int = 42,
+    tolerance: int | None = None,
     keep_existing_alpha: bool = False,
-    bg_hint: tuple[int, int, int] | None = None,
+    bg_hint: tuple[int, int, int] | list[tuple[int, int, int]] | None = None,
     allow_mostly_background: bool = False,
     *,
     quality_size: int = TARGET_SIZE,
@@ -431,14 +548,15 @@ def auto_remove_background(
     """
     对没有透明通道的图片，自动去除纯色/渐变背景（含阴影）。
 
-    方法: 取边框像素的中位色作为背景色，从四条边框向内做 BFS 洪水填充。
-    除"颜色与背景色距离 <= tolerance"的经典规则外，还支持:
+    方法: 把边框像素聚类为 1~3 个背景色 (多背景色聚类), 从四条边框向内做
+    BFS 洪水填充。tolerance 默认按边框噪声自动估计 (中位数 + k×MAD,
+    限幅 24~88)。除"颜色与某背景色距离 <= tolerance"的经典规则外，还支持:
 
       0) 深色均匀条带 (截图 UI 条) 预抠 —— 紧贴边框的均匀深色行/列被识别为
          图像外的装饰, 直接标记为背景且不参与播种。否则洪水会从条带平滑漫入
          颜色完全相同的黑色头发/领带/西服 (深色主体部件与 UI 条无法用颜色区分,
          只能靠"条带=均匀+贴边"的结构特征分离)。
-      1) 梯度规则 —— 逐像素颜色变化 <= GRAD_STEP 且距背景色 <= GRAD_CAP
+      1) 梯度规则 —— 逐像素颜色变化 <= GRAD_STEP 且距最近背景簇 <= GRAD_CAP
          的像素可沿渐变一路穿越。这使两类背景都能整体去除: 白色平面 +
          明显阴影 (亮度渐变), 以及彩色背景的色相/亮度漂移 (如证件照蓝底
          的照明渐变)。主体受多重保护: GRAD_CAP 挡住距背景色过远的主体
@@ -449,17 +567,22 @@ def auto_remove_background(
          主洪水够不到；凡与"主体彩色连通块"（高饱和、内部平滑、足够大）相邻
          的低饱和背景像素，一并并入背景，上限 ISLAND_MAX 与收紧的
          ISLAND_CAP 防止误吃浅色皮肤高光等低饱和主体部件。
+      3) 贴边主体门控 —— 每条边被分成若干小段, 段中位色距任何背景簇都超过
+         动态容差时, 该段不参与播种 (很可能是贴在边上的主体, 洪水会从其内部
+         开始); 全部段被拒时回退为逐像素播种, 由候选掩码回退与质量诊断兜底。
 
-    工作尺寸取 min(BG_WORK_SIZE, 原图最大边)：小图不放大，避免噪声被
-    缩放的平滑效应抹平后误当渐变背景漫灌。
+    工作尺寸取目标光标尺寸的 WORK_SCALE 倍 (48→192, 64→256, 96→384,
+    上限 WORK_MAX_SIDE) 且保持原图长宽比; 小图不放大, 避免噪声被缩放的
+    平滑效应抹平后误当渐变背景漫灌。
 
     Args:
         img: RGBA 或 RGB 图像
-        tolerance: 颜色容差（欧氏距离上限）
+        tolerance: 颜色容差（欧氏距离上限）；None 时按边框噪声自动估计
         keep_existing_alpha: True 时即使图片已有透明通道也执行抠背景，
             最终 alpha = min(原 alpha, 抠图掩码)。
             用于动画文件（如 GIF）中部分帧透明、部分帧纯色背景的情况，
             保证所有帧背景一致，避免播放时闪现背景色块。
+        bg_hint: 基准背景色（多帧动画共用）；也接受背景色列表
         quality_size: 在实际光标尺度上评估掩码质量（通常为 48/64/96）。
         return_diagnostics: True 时额外返回 RemovalDiagnostics；默认保持旧的
             ``(image, ok)`` 调用契约。
@@ -497,25 +620,34 @@ def auto_remove_background(
         )
         return _result(img, True, diag)
 
-    # 工作尺寸: 只缩小不放大。放大小图会把噪声/高频细节抹平成"平滑渐变",
-    # 导致梯度规则把噪声误当背景漫灌 (如 64px 随机噪声图)。
-    work = min(BG_WORK_SIZE, max(img.width, img.height))
-    small = img.convert("RGB").resize((work, work), Image.LANCZOS)
-    w = h = work
+    # 工作尺寸: 目标光标尺寸的 WORK_SCALE 倍且保持长宽比, 只缩小不放大。
+    # 放大小图会把噪声/高频细节抹平成"平滑渐变", 导致梯度规则把噪声误当
+    # 背景漫灌 (如 64px 随机噪声图)。
+    work_side = min(WORK_MAX_SIDE, max(16, int(round(WORK_SCALE * quality_size))))
+    w, h = _work_dims(img.width, img.height, work_side)
+    small = img.convert("RGB").resize((w, h), Image.LANCZOS)
     px = small.load()
 
     # 深色均匀条带 (截图 UI 条): 预标记为已抠, 且不参与播种 —— 否则洪水会从
     # 条带平滑漫入颜色相同的黑色头发/领带/西服
     strip = _edge_strip_mask(px, w, h)
 
-    # 背景色: 优先使用调用方给的基准色（多帧动画共用），否则取边框主色
-    if bg_hint is not None:
-        bg = tuple(bg_hint)
+    # 背景色簇: 优先使用调用方给的基准色（多帧动画共用, 单簇），
+    # 否则从边框聚类出 1~3 个背景色 (双色/多色背景分别扩张)。
+    if bg_hint is None:
+        bgs = _estimate_background_clusters(img, work_side)
+    elif len(bg_hint) == 3 and all(isinstance(v, int) for v in bg_hint):
+        bgs = [tuple(bg_hint)]
     else:
-        bg = estimate_background_color(img)
+        bgs = [tuple(c) for c in bg_hint]
 
-    def near(c1: tuple, c2: tuple, tol: float) -> bool:
-        return (c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2 + (c1[2] - c2[2]) ** 2 <= tol * tol
+    border_cells = _border_cells(px, w, h, strip)
+    tol = float(tolerance) if tolerance is not None else (
+        _dynamic_tolerance(border_cells, bgs) if border_cells else 42.0)
+    tol2 = tol * tol
+    grad_step2 = GRAD_STEP * GRAD_STEP
+    grad_cap2 = GRAD_CAP * GRAD_CAP
+    island_cap2 = ISLAND_CAP * ISLAND_CAP
 
     def sat(c: tuple) -> int:
         return max(c) - min(c)
@@ -523,20 +655,35 @@ def auto_remove_background(
     def lum(c: tuple) -> float:
         return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
 
+    single_bg = len(bgs) == 1
+    bg0 = bgs[0]
+
+    def bg_min(c: tuple) -> tuple[int, int]:
+        """返回 (距最近背景簇的平方距离, 簇下标)。"""
+        if single_bg:
+            return _d2(c, bg0), 0
+        best_i = 0
+        best_d = _d2(c, bgs[0])
+        for i in range(1, len(bgs)):
+            d = _d2(c, bgs[i])
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_d, best_i
+
     # ── 主洪水 (BFS, 从边框种子开始) ──
-    # 经典规则: dist(P, bg) <= tolerance —— 均匀背景快速扩散
-    # 梯度规则: dist(P, Q) <= GRAD_STEP 且 dist(P, bg) <= GRAD_CAP 且
-    #           (P.R - P.B) <= bg.R - bg.B + HUE_DELTA 且亮度 >= LUM_FLOOR ——
+    # 经典规则: dist(P, 最近背景簇) <= tolerance —— 均匀背景快速扩散
+    # 梯度规则: dist(P, Q) <= GRAD_STEP 且 dist(P, 最近背景簇) <= GRAD_CAP 且
+    #           (P.R - P.B) <= 簇.R - 簇.B + HUE_DELTA 且亮度 >= LUM_FLOOR ——
     #   平滑渐变 (阴影/光照/彩色背景的色相漂移) 可以一路穿越; 主体由多层保护:
     #   GRAD_CAP (距背景色过远), 轮廓锐利跳变 (> GRAD_STEP), 色相一致性
     #   (主体是暖色), 亮度下限 (深色主体部件)。
     visited = [[False] * w for _ in range(h)]
     q: deque[tuple[int, int]] = deque()
-    hue_max = bg[0] - bg[2] + HUE_DELTA
 
     def seed_ok(c: tuple) -> bool:
-        return near(c, bg, tolerance) or (
-            sat(c) <= SEED_SAT_LIMIT and near(c, bg, GRAD_CAP)
+        d2, _i = bg_min(c)
+        return d2 <= tol2 or (
+            sat(c) <= SEED_SAT_LIMIT and d2 <= grad_cap2
             and lum(c) >= LUM_FLOOR)
 
     def try_seed(x: int, y: int) -> None:
@@ -547,14 +694,43 @@ def auto_remove_background(
             visited[y][x] = True
             q.append((x, y))
 
-    for x in range(w):
-        for y in (0, h - 1):
-            if not strip[y][x]:
-                try_seed(x, y)
-    for y in range(h):
-        for x in (0, w - 1):
-            if not strip[y][x]:
-                try_seed(x, y)
+    # 贴边主体门控: 每条边分成若干小段; 段中位色距任何背景簇都超过动态容差
+    # 时, 该段不播种 (很可能是贴在边上的主体, 洪水会从其内部开始)。全部段
+    # 被拒时回退为逐像素播种, 结果质量由候选掩码回退与质量诊断兜底。
+    seg_len = max(SEG_LEN_MIN, min(w, h) // 8)
+    seeded_any = False
+
+    def seed_segment(seg_cells: list) -> None:
+        nonlocal seeded_any
+        if len(seg_cells) < 3:
+            return
+        med = _median_color([px[x, y] for x, y in seg_cells])
+        if min(_d2(med, b) for b in bgs) > tol2:
+            return
+        seeded_any = True
+        for x, y in seg_cells:
+            try_seed(x, y)
+
+    for y in (0, h - 1):
+        for sx in range(0, w, seg_len):
+            seed_segment([(x, y) for x in range(sx, min(w, sx + seg_len))
+                          if not strip[y][x]])
+    for x in (0, w - 1):
+        for sy in range(0, h, seg_len):
+            seed_segment([(x, y) for y in range(sy, min(h, sy + seg_len))
+                          if not strip[y][x]])
+
+    if not seeded_any:
+        # 所有边缘段都不属于背景 (主体贴满四周): 回退为逐像素播种,
+        # 结果质量由候选掩码回退与质量诊断兜底。
+        for x in range(w):
+            for y in (0, h - 1):
+                if not strip[y][x]:
+                    try_seed(x, y)
+        for y in range(h):
+            for x in (0, w - 1):
+                if not strip[y][x]:
+                    try_seed(x, y)
     # 条带内侧边界单元格也作为候选种子 (条带被预抠后, 照片边缘露出)
     for y in range(h):
         for x in range(w):
@@ -573,10 +749,12 @@ def auto_remove_background(
             nx, ny = cx + dx, cy + dy
             if 0 <= nx < w and 0 <= ny < h and not visited[ny][nx]:
                 nc = px[nx, ny]
-                ok = near(nc, bg, tolerance) or (
-                    near(nc, pc, GRAD_STEP) and near(nc, bg, GRAD_CAP)
-                    and nc[0] - nc[2] <= hue_max
-                    and (0.299 * nc[0] + 0.587 * nc[1] + 0.114 * nc[2]) >= LUM_FLOOR)
+                bd2, bi = bg_min(nc)
+                ok = bd2 <= tol2 or (
+                    bd2 <= grad_cap2
+                    and _d2(nc, pc) <= grad_step2
+                    and nc[0] - nc[2] <= bgs[bi][0] - bgs[bi][2] + HUE_DELTA
+                    and lum(nc) >= LUM_FLOOR)
                 if ok:
                     visited[ny][nx] = True
                     q.append((nx, ny))
@@ -636,9 +814,10 @@ def auto_remove_background(
                 subjects.append(comp)
 
     def island_ok(c: tuple) -> bool:
-        return (sat(c) <= ISLAND_SAT and near(c, bg, ISLAND_CAP)
-                and c[0] - c[2] <= ISLAND_WARM
-                and 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] >= LUM_FLOOR)
+        bd2, bi = bg_min(c)
+        return (sat(c) <= ISLAND_SAT and bd2 <= island_cap2
+                and c[0] - c[2] <= bgs[bi][0] - bgs[bi][2] + ISLAND_WARM
+                and lum(c) >= LUM_FLOOR)
 
     island_visited = [[False] * w for _ in range(h)]
     for comp in subjects:
@@ -704,8 +883,8 @@ def auto_remove_background(
     # ── 彩色口袋填充 (逐像素) ──
     # 高饱和背景 (如证件照蓝底) 可能被主体+UI 条带四面围死, 主洪水/低饱和
     # 孤岛都够不到。逐像素补抠: 未访问的高饱和(S>ISLAND_SAT)像素, 若
-    # (a) 距背景色 <= GRAD_CAP (脸 220+/蟑螂 260+ 超限被拒),
-    # (b) 色相一致 (R-B <= hue_max, 暖色皮肤/领带被拒),
+    # (a) 距最近背景簇 <= GRAD_CAP (脸 220+/蟑螂 260+ 超限被拒),
+    # (b) 色相一致 (R-B <= 簇.R-簇.B+HUE_DELTA, 暖色皮肤/领带被拒),
     # (c) 局部平滑 (其彩色 4-邻域平均差 <= COHERENCE, 随机噪声邻域差大被拒),
     # 则并入背景。
     chroma_visited = [[False] * w for _ in range(h)]
@@ -718,7 +897,8 @@ def auto_remove_background(
             if not chroma_visited[y][x]:
                 continue
             c = px[x, y]
-            if not near(c, bg, GRAD_CAP) or c[0] - c[2] > hue_max:
+            bd2, bi = bg_min(c)
+            if bd2 > grad_cap2 or c[0] - c[2] > bgs[bi][0] - bgs[bi][2] + HUE_DELTA:
                 continue
             total_d = 0.0
             pairs = 0
