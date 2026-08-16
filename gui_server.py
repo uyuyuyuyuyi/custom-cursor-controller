@@ -28,7 +28,7 @@ import tempfile
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from PIL import Image
 
@@ -58,6 +58,36 @@ def _sanitize_name(name: str, fallback: str = "未命名") -> str:
     name = os.path.basename(name or "").strip()
     name = "".join(ch for ch in name if ch not in '<>:"/\\|?*').strip()
     return name[:80] or fallback
+
+
+def _decode_filename(raw: bytes) -> str:
+    """将 multipart filename 的原始字节解码为正确文本。
+
+    浏览器（Chrome/Edge/Firefox）把非 ASCII 文件名以 UTF-8 原始字节
+    直接写入 filename="..."；少数旧客户端可能用 GBK。按
+    UTF-8 → GBK → latin-1 依次尝试，保证不抛异常。
+    """
+    for enc in ("utf-8", "gbk", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", "replace")
+
+
+def _repair_mojibake(name: str) -> str:
+    """修复历史数据中因 latin-1 误解码产生的乱码（UTF-8 字节被当 latin-1 读）。
+
+    仅当字符串整体能按 latin-1 还原为字节、且还原后是合法 UTF-8 文本
+    （含非 ASCII 字符）时才修复，否则原样返回，避免误伤正常名称。
+    """
+    try:
+        repaired = name.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+    if repaired == name or not any(ord(ch) > 127 for ch in repaired):
+        return name
+    return repaired
 
 
 class CursorStore:
@@ -120,6 +150,21 @@ class CursorStore:
             self.index = {}
         self.index.setdefault("uploads", {})
         self.index.setdefault("cursors", {})
+        self._repair_index_names()
+
+    def _repair_index_names(self) -> None:
+        """修复历史条目中因 multipart latin-1 误解码产生的乱码名称。"""
+        changed = False
+        for table, field in ((self.index.get("uploads", {}), "original"),
+                             (self.index.get("cursors", {}), "name")):
+            for entry in table.values():
+                if isinstance(entry.get(field), str):
+                    fixed = _repair_mojibake(entry[field])
+                    if fixed != entry[field]:
+                        entry[field] = fixed
+                        changed = True
+        if changed:
+            self._save()
 
     def _save(self) -> None:
         tmp = self.index_path + ".tmp"
@@ -1062,17 +1107,36 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                 header_end = part.find(b"\r\n\r\n")
                 if header_end < 0:
                     continue
+                # 头部用 latin-1 解码是字节无损的（每个字节映射到同码点），
+                # 因此可借此恢复 filename 的原始字节再正确解码（UTF-8/GBK）。
                 headers = part[:header_end].decode("latin-1", "replace")
                 body = part[header_end + 4:]
                 if body.endswith(b"\r\n"):
                     body = body[:-2]
                 name = None
+                name_star = None
                 for line in headers.split("\r\n"):
                     if line.lower().startswith("content-disposition"):
                         for seg in line.split(";"):
                             seg = seg.strip()
-                            if seg.startswith("filename="):
-                                name = seg[9:].strip('"')
+                            low = seg.lower()
+                            if low.startswith("filename*="):
+                                # RFC 5987: filename*=UTF-8''%E5%9B%BE%E7%89%87.png
+                                try:
+                                    parts_ = seg.split("=", 1)[1].split("'", 2)
+                                    if len(parts_) == 3:
+                                        name_star = unquote(
+                                            parts_[2],
+                                            encoding=parts_[0] or "utf-8",
+                                            errors="replace")
+                                except (ValueError, IndexError, LookupError):
+                                    pass
+                            elif low.startswith("filename="):
+                                raw_val = seg[9:].strip('"').encode("latin-1", "replace")
+                                name = _decode_filename(raw_val)
+                # 按 RFC 5987，filename* 优先于 filename
+                if name_star:
+                    name = name_star
                 if name:
                     files.append((name, body))
             if not files:

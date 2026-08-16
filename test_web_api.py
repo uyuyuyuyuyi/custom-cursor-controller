@@ -28,8 +28,12 @@ def req(method, url, body=None, headers=None):
     with urllib.request.urlopen(r, timeout=15) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
-def upload(url, images):
-    """手工构造 multipart/form-data；每项可为 PIL Image 或已编码的 bytes。"""
+def upload(url, images, names=None):
+    """手工构造 multipart/form-data；每项可为 PIL Image 或已编码的 bytes。
+
+    names: 可选文件名列表（None 时用 f{i}.png）。
+    非 ASCII 文件名按浏览器行为以 UTF-8 原始字节写入 filename="..."。
+    """
     boundary = "----testboundary1234"
     parts = []
     for i, item in enumerate(images):
@@ -38,9 +42,10 @@ def upload(url, images):
         else:
             buf = io.BytesIO()
             item.save(buf, format="PNG")
+        fname = names[i] if (names and i < len(names)) else f"f{i}.png"
         parts.append(
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="files"; filename="f{i}.png"\r\n'
+            f'Content-Disposition: form-data; name="files"; filename="{fname}"\r\n'
             f"Content-Type: image/png\r\n\r\n".encode() + buf.getvalue() + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     body = b"".join(parts)
@@ -184,6 +189,62 @@ def main():
         req("POST", url + f"/api/gallery/uploads/{uid}/delete")
     _, gal_clean = req("GET", url + "/api/gallery")
     check("取消后新条目已清理", all(c["id"] != cid_new for c in gal_clean["cursors"]))
+
+    # 2f. 中文文件名: 浏览器以 UTF-8 原始字节发送 filename → 不得乱码
+    _, up_cn = upload(url, [make_arrow((40, 120, 255, 255))], names=["我的图片.png"])
+    check("中文文件名上传 cursor_name 正确", up_cn.get("cursor_name") == "我的图片",
+          f"got={up_cn.get('cursor_name')!r}")
+    _, gal_cn = req("GET", url + "/api/gallery")
+    cn_upload = next((u for u in gal_cn["uploads"] if u["id"] in up_cn["upload_ids"]), None)
+    check("图库图片名无乱码", cn_upload is not None
+          and cn_upload["original"] == "我的图片.png",
+          f"got={cn_upload and cn_upload.get('original')!r}")
+    cn_cursor = next((c for c in gal_cn["cursors"] if c["id"] == up_cn["cursor_id"]), None)
+    check("图库光标名无乱码", cn_cursor is not None and cn_cursor["name"] == "我的图片",
+          f"got={cn_cursor and cn_cursor.get('name')!r}")
+
+    # 2g. RFC 5987 filename*=UTF-8''%XX 形式（部分客户端/代理使用）
+    import urllib.parse as _up
+    star_name = _up.quote("小红点.png")
+    boundary = "----testboundary5987"
+    _png = io.BytesIO()
+    make_arrow((255, 80, 80, 255)).save(_png, format="PNG")
+    star_body = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"files\"; "
+        f"filename=\"fallback.png\"; filename*=UTF-8''{star_name}\r\n"
+        f"Content-Type: image/png\r\n\r\n").encode() + _png.getvalue() + b"\r\n" \
+        + f"--{boundary}--\r\n".encode()
+    _, up_star = req("POST", url + "/api/upload", star_body,
+                     {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    check("RFC5987 filename* 解码正确", up_star.get("cursor_name") == "小红点",
+          f"got={up_star.get('cursor_name')!r}")
+
+    # 2h. 历史乱码数据自动修复（latin-1 误解码的 UTF-8 名称）
+    from gui_server import CursorStore, _decode_filename, _repair_mojibake
+    check("_decode_filename UTF-8 解码", _decode_filename("图片.png".encode("utf-8"))
+          == "图片.png")
+    # GBK 回退: 选 UTF-8 严格解码必失败的字节（如"我的光标"的 GBK 编码）
+    check("_decode_filename GBK 回退", _decode_filename("我的光标.png".encode("gbk"))
+          == "我的光标.png")
+    mjb = "图片.png".encode("utf-8").decode("latin-1")   # 旧 bug 产物: "å¾çç.png"
+    check("_repair_mojibake 识别乱码", _repair_mojibake(mjb) == "图片.png",
+          f"got={_repair_mojibake(mjb)!r}")
+    check("_repair_mojibake 放过正常名", _repair_mojibake("正常.png") == "正常.png")
+    fix_root = os.path.join(store_root, "repair_store")
+    os.makedirs(fix_root, exist_ok=True)
+    with open(os.path.join(fix_root, "index.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "uploads": {"u1": {"id": "u1", "original": mjb}},
+            "cursors": {"c1": {"id": "c1", "name": mjb}},
+        }, f, ensure_ascii=False)
+    fix_store = CursorStore(root=fix_root)
+    check("图库历史乱码自动修复(图片)",
+          fix_store.index["uploads"]["u1"]["original"] == "图片.png",
+          f"got={fix_store.index['uploads']['u1']['original']!r}")
+    check("图库历史乱码自动修复(光标)",
+          fix_store.index["cursors"]["c1"]["name"] == "图片.png",
+          f"got={fix_store.index['cursors']['c1']['name']!r}")
 
     # 3. 启用（真实替换系统光标！）
     _, ap = req("POST", url + "/api/apply")
