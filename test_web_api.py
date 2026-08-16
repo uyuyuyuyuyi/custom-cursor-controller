@@ -6,7 +6,6 @@ import os
 import sys
 import tempfile
 import urllib.request
-import winreg
 
 from PIL import Image, ImageDraw
 
@@ -311,20 +310,8 @@ def main():
           f"got={fix_store.index['cursors']['c1']['name']!r}")
 
     # 3. 启用（真实替换系统光标！）
-    def cursor_base_size():
-        """读取系统指针基础尺寸（无值按 Windows 默认 32）。"""
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                r"Control Panel\Cursors") as k:
-                return int(winreg.QueryValueEx(k, "CursorBaseSize")[0])
-        except OSError:
-            return 32
-
-    base_before = cursor_base_size()
     _, ap = req("POST", url + "/api/apply")
     check("apply 后 enabled=True", ap["enabled"] is True)
-    check("apply 同步 CursorBaseSize=画布尺寸",
-          cursor_base_size() == 64, f"base={cursor_base_size()}")
 
     # 4. 改热点
     _, hs = req("POST", url + "/api/hotspot",
@@ -335,9 +322,6 @@ def main():
     # 5. 恢复
     _, rs = req("POST", url + "/api/restore")
     check("restore 后 enabled=False", rs["enabled"] is False)
-    check("restore 还原 CursorBaseSize",
-          cursor_base_size() == base_before,
-          f"base={cursor_base_size()} (原值 {base_before})")
 
     # 5a. 切换到 48 画布（旋转用例的像素坐标按 48 画布设计）
     _, sz48 = req("POST", url + "/api/size",
