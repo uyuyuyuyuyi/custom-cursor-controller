@@ -301,6 +301,7 @@ class CursorStore:
             "size": meta.get("size", 64),
             "hotspot": meta.get("hotspot", [32, 32]),
             "frames": meta.get("frames", 1),
+            "durations": meta.get("durations", []),
             "animated": meta.get("animated", False),
             "upload_ids": meta.get("upload_ids", []),
             "source_hashes": sorted(meta.get("source_hashes", [])),
@@ -566,6 +567,15 @@ class CursorApp:
             "removal_diagnostics": representative.as_dict() if representative else None,
         }
 
+    @staticmethod
+    def _entry_durations(entry: dict, frame_count: int) -> list[int]:
+        """读取图库光标条目保存的逐帧时长；旧条目无此字段时退回默认。"""
+        stored = entry.get("durations")
+        if (isinstance(stored, list) and len(stored) == frame_count
+                and all(isinstance(v, int) for v in stored)):
+            return [max(20, min(2000, v)) for v in stored]
+        return [FRAME_MS] * frame_count
+
     def upload(self, file_items: list[tuple[str, bytes]]) -> dict:
         import datetime
         (processed, durations, file_info, verdicts, worst,
@@ -642,6 +652,7 @@ class CursorApp:
             ani_bytes, preview_buf.getvalue(), frames_png,
             {"name": cursor_name, "created": now, "size": self.canvas_size,
              "hotspot": list(self.hotspot), "frames": len(frames),
+             "durations": durations[: len(frames)],
              "animated": len(frames) > 1, "upload_ids": upload_ids,
              "source_hashes": file_shas},
         )
@@ -719,7 +730,7 @@ class CursorApp:
                 self.frames = frames
                 self.canvas_size = existing["size"]
                 self.hotspot = tuple(existing["hotspot"])
-                self.durations = [FRAME_MS] * len(frames)
+                self.durations = self._entry_durations(existing, len(frames))
                 self.src_size = (frames[0].width, frames[0].height)
                 self.verdict = self.score = None
                 self.issues = []
@@ -792,6 +803,7 @@ class CursorApp:
             ani_bytes, preview_buf.getvalue(), frames_png,
             {"name": cursor_name, "created": now, "size": self.canvas_size,
              "hotspot": list(self.hotspot), "frames": len(frames),
+             "durations": durations[: len(frames)],
              "animated": len(frames) > 1, "upload_ids": [uid],
              "source_hashes": [sha]},
         )
@@ -1006,7 +1018,7 @@ class CursorApp:
             self.frames = frames
             self.canvas_size = entry["size"]
             self.hotspot = tuple(entry["hotspot"])
-            self.durations = [FRAME_MS] * len(frames)
+            self.durations = self._entry_durations(entry, len(frames))
             self.src_size = (frames[0].width, frames[0].height)
             self.verdict = self.score = None
             self.issues = []

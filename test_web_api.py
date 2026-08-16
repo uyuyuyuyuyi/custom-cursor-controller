@@ -411,6 +411,23 @@ def main():
     check("GIF 帧时长 200ms → jiffies=[12,12]", jiffies == [12, 12], str(jiffies))
     req("POST", url + "/api/restore")
 
+    # 5d2. 图库应用 + 启用中重建仍保留 GIF 帧时长（回归: 不得丢成默认 150ms）
+    cid_gif = gif_up["cursor_id"]
+    _, ga_gif = req("POST", url + f"/api/gallery/cursors/{cid_gif}/apply")
+    check("图库应用 GIF 光标", ga_gif["enabled"] is True)
+    req("POST", url + "/api/hotspot",
+        json.dumps({"x": 30, "y": 30}).encode(),
+        {"Content-Type": "application/json"})      # 启用中 → 重建 .ani
+    with open(ani_path, "rb") as f:
+        ani2 = f.read()
+    rate_idx2 = ani2.find(b"rate")
+    rate_size2 = _struct.unpack_from("<I", ani2, rate_idx2 + 4)[0]
+    jiffies2 = list(_struct.unpack_from("<" + "I" * (rate_size2 // 4),
+                                        ani2, rate_idx2 + 8))
+    check("图库应用后重建仍保留帧时长 jiffies=[12,12]",
+          jiffies2 == [12, 12], str(jiffies2))
+    req("POST", url + "/api/restore")
+
     # 5e. 真实 GIF（白底动画）: 所有帧背景统一透明（修复白底闪现）
     gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "test_res", "cockroach-dancing.gif")
