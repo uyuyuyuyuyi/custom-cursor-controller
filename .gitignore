@@ -19,6 +19,7 @@ diagnose_ani.py
 diagnose_frames.py
 test_*.ani
 test_*.cur
+.analysis_outputs/
 
 # Preview images
 *_preview.png

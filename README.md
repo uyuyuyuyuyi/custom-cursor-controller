@@ -113,8 +113,10 @@ custom-cursor-controller/
 │                          # consistency for GIFs) 图片适合度分析 + 自动抠背景（含 GIF 帧一致性）
 ├── ani_builder.py         # Pure-Python RIFF/ACON (.ani) binary builder
 │                          # 纯 Python 的 RIFF/ACON (.ani) 二进制构建器
-├── test_web_api.py        # End-to-end API tests (60 checks, incl. real cursor swap)
-│                          # API 端到端测试（60 项，含真实光标替换）
+├── test_web_api.py        # End-to-end API tests (95 checks, incl. real cursor swap)
+│                          # API 端到端测试（95 项，含真实光标替换）
+├── test_image_quality.py  # Real-image mask/alpha quality regressions (no cursor swap)
+│                          # 真实图片抠图/Alpha 质量回归（不会替换系统光标）
 ├── CustomCursorController.spec  # PyInstaller spec (embeds webui/dist)
 │                          # 打包配置（内嵌前端）
 ├── requirements.txt       # pystray + Pillow + pywebview + pythonnet
@@ -128,8 +130,8 @@ custom-cursor-controller/
 
 ## 🔧 How it works / 工作原理
 
-1. **Analysis / 分析** — `pointer_analyzer.py` scores each image (blank / contrast / complexity / fill / aspect / resolution) and auto-removes solid backgrounds via flood-fill; for animated files it uses a shared background color across all frames so no background flashes during playback.
-   `pointer_analyzer.py` 对图片逐项评分（空白/对比度/复杂度/填充率/长宽比/分辨率），并用洪水填充自动去除纯色背景；动画文件使用**跨帧统一的背景色**，避免播放时闪现背景色块。
+1. **Analysis / 分析** — `pointer_analyzer.py` scores each image and auto-removes simple backgrounds via flood-fill. It keeps conservative/island/aggressive mask candidates, rolls back destructive post-processing, and measures fragments, holes, edge leakage, and foreground coverage at the actual cursor size. Low-confidence results require confirmation instead of being auto-applied. Animated files share one background color across frames.
+   `pointer_analyzer.py` 对图片逐项评分并用洪水填充去除简单背景；同时保留保守/孤岛/激进三档掩码，补抠破坏主体时自动回退，并在实际光标尺寸检查碎片、孔洞、边框残留与主体占比。低可信结果只预览、需用户确认，不再静默自动应用；动画帧仍共享统一背景色。
 
 2. **Format / 格式** — `ani_builder.py` hand-writes the RIFF `ACON` structure: `anih` header, `rate` chunk (ms → jiffies at 1/60 s), `fram` LIST with one PNG-compressed `.cur` per frame, optional `INFO` metadata, with WORD alignment.
    `ani_builder.py` 手工拼写 RIFF `ACON` 结构：`anih` 头、`rate` 块（毫秒换算为 1/60s 的 jiffy）、`fram` LIST（每帧一个 PNG 压缩的 `.cur`）、可选 `INFO` 元数据，含 WORD 对齐。
@@ -159,8 +161,10 @@ custom-cursor-controller/
 
 ## 🧪 Tests / 自测脚本
 
-- `python test_web_api.py` — end-to-end API tests: upload/analyze/apply/restore, rotate & size, gallery CRUD, content dedup, GIF multi-frame + white-background consistency (60 checks, briefly swaps the real cursor).
-  端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性（60 项，会短暂替换真实光标）。
+- `python test_web_api.py` — end-to-end API tests: upload/analyze/apply/restore, rotate & size, gallery CRUD, content dedup, GIF multi-frame + white-background consistency (95 checks, briefly swaps the real cursor).
+  端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性（95 项，会短暂替换真实光标）。
+- `python -m unittest -v test_image_quality.py` — real `test_res` confidence routing, destructive-postfill rollback, and premultiplied-alpha regressions; does not touch the system cursor.
+  真实 `test_res` 可信度路由、破坏性补抠回退与预乘 Alpha 回归测试；不会替换系统光标。
 - `python -m ani_builder` — writes a 2-frame test cursor `test_cursor.ani`.
   生成两帧测试光标 `test_cursor.ani`。
 
