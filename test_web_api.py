@@ -72,6 +72,22 @@ def preview_pixel(previews, i, x, y):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
     return img.getpixel((x * 4 + 2, y * 4 + 2))
 
+def map_point(src_pt, src_size, cs, crop_box):
+    """把源图坐标映射到"裁剪+适配"后的画布逻辑坐标（第二阶段 alpha bbox 裁剪）。"""
+    if crop_box:
+        l, t, r, b = crop_box
+        scale = min(cs / (r - l), cs / (b - t))
+        w = max(1, round((r - l) * scale))
+        h = max(1, round((b - t) * scale))
+        ox, oy = (cs - w) // 2, (cs - h) // 2
+        return (round((src_pt[0] - l) * scale) + ox,
+                round((src_pt[1] - t) * scale) + oy)
+    scale = min(cs / src_size[0], cs / src_size[1], 1.0)
+    w = max(1, round(src_size[0] * scale))
+    h = max(1, round(src_size[1] * scale))
+    ox, oy = (cs - w) // 2, (cs - h) // 2
+    return (round(src_pt[0] * scale) + ox, round(src_pt[1] * scale) + oy)
+
 def make_blank():
     return Image.new("RGBA", (48, 48), (0, 0, 0, 0))
 
@@ -435,8 +451,9 @@ def main():
           f"verdict={sp.get('verdict')} score={sp.get('score')} issues={sp.get('issues')}")
     # 预览为 4 倍放大: 检查四角透明 / 主体中心不透明 / 主体下方深阴影处透明
     cs = sp["canvas_size"]                      # 此时画布可能不是 64 (前面测试切过尺寸)
-    body_pos = (round(80 * cs / 160), round(72 * cs / 160))      # 源坐标 (80,72)
-    shadow_pos = (round(80 * cs / 160), round(115 * cs / 160))   # 源坐标 (80,115)
+    crop_box = sp.get("crop_box")               # 第二阶段: alpha bbox 自动裁剪
+    body_pos = map_point((80, 72), (160, 160), cs, crop_box)      # 源坐标 (80,72)
+    shadow_pos = map_point((80, 115), (160, 160), cs, crop_box)   # 源坐标 (80,115)
     pv_img = Image.open(io.BytesIO(base64.b64decode(
         sp["previews"][0].split(",", 1)[1]))).convert("RGBA")
     corners_ok = all(pv_img.getpixel(c)[3] <= 120 for c in
@@ -455,16 +472,23 @@ def main():
     check("证件照非硬拒绝", bp.get("hard_reject") is False,
           f"verdict={bp.get('verdict')} score={bp.get('score')}")
     cs = bp["canvas_size"]
+    crop_box = bp.get("crop_box")
     bp_img = Image.open(io.BytesIO(base64.b64decode(
         bp["previews"][0].split(",", 1)[1]))).convert("RGBA")
-    face_a = bp_img.getpixel((round(122 * cs / 240) * 4 + 2,
-                              round(143 * cs / 240) * 4 + 2))[3]
+    face_pos = map_point((122, 143), (240, 240), cs, crop_box)
+    shade_pos = map_point((152, 148), (240, 240), cs, crop_box)
+    # 蓝底检查点: 裁剪后原蓝底区域已被裁掉, 改取裁剪框内左侧边距处(必为背景)
+    # (crop_box 是源图坐标, 需经 map_point 映射回画布坐标)
+    if crop_box:
+        src_pt = (crop_box[0] + 1, (crop_box[1] + crop_box[3]) // 2)
+        blue_pos = map_point(src_pt, (240, 240), cs, crop_box)
+    else:
+        blue_pos = map_point((30, 120), (240, 240), cs, crop_box)
+    face_a = bp_img.getpixel((face_pos[0] * 4 + 2, face_pos[1] * 4 + 2))[3]
     check("证件照脸部保留", face_a > 200, f"face_alpha={face_a}")
-    shade_a = bp_img.getpixel((round(152 * cs / 240) * 4 + 2,
-                               round(148 * cs / 240) * 4 + 2))[3]
+    shade_a = bp_img.getpixel((shade_pos[0] * 4 + 2, shade_pos[1] * 4 + 2))[3]
     check("证件照阴影皮肤保留", shade_a > 200, f"shade_alpha={shade_a}")
-    blue_a = bp_img.getpixel((round(30 * cs / 240) * 4 + 2,
-                              round(120 * cs / 240) * 4 + 2))[3]
+    blue_a = bp_img.getpixel((blue_pos[0] * 4 + 2, blue_pos[1] * 4 + 2))[3]
     check("证件照蓝底已去除", blue_a <= 120, f"blue_alpha={blue_a}")
     corner_a = bp_img.getpixel((2, 2))[3]
     check("证件照深色条带已去除", corner_a <= 120, f"corner_alpha={corner_a}")
