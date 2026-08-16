@@ -33,13 +33,32 @@ from urllib.parse import unquote, urlparse
 from PIL import Image
 
 from ani_builder import build_ani_file, save_ani_file
-from pointer_analyzer import HARD_REJECT_CODES, analyze, auto_remove_background
+from pointer_analyzer import (
+    HARD_REJECT_CODES,
+    RemovalDiagnostics,
+    analyze,
+    auto_remove_background,
+)
 from cursor_manager import CursorManager
 
 CANVAS_SIZE = 48            # 旧默认（兼容引用）
 DEFAULT_CANVAS_SIZE = 64    # 光标画布尺寸（可在界面选择 48/64/96）
 FRAME_MS = 150              # 默认帧时长
 SIZE_CHOICES = (32, 48, 64, 96, 128)
+
+
+def _resize_rgba_premultiplied(
+    img: Image.Image,
+    size: tuple[int, int],
+    resample=Image.Resampling.LANCZOS,
+) -> Image.Image:
+    """用预乘 alpha 缩放 RGBA，避免透明像素隐藏 RGB 造成黑/白色边缘泄漏。"""
+    rgba = img.convert("RGBA")
+    if rgba.size == size:
+        return rgba.copy()
+    # Pillow 的 RGBa 是预乘 alpha 模式；缩放后转回直 alpha 的 RGBA。
+    return rgba.convert("RGBa").resize(size, resample).convert("RGBA")
+
 
 # 静态前端目录: 源码运行时在 webui/dist，打包后在 _MEIPASS/webui
 def _find_webui_dir() -> str | None:
@@ -358,6 +377,9 @@ class CursorApp:
         self.verdict: str | None = None
         self.score: int | None = None
         self.issues: list[dict] = []
+        self.removal_confidence: str | None = None
+        self.auto_apply_allowed = False
+        self.removal_diagnostics: dict | None = None
         self.src_size: tuple[int, int] | None = None
         self.last_cursor_id: str | None = None
 
@@ -366,14 +388,16 @@ class CursorApp:
         """解析/抠背景/逐帧分析一组文件（upload 与图库"生成光标"共用）。
 
         Returns:
-            (processed, durations, file_info, verdicts, worst)
+            (processed, durations, file_info, verdicts, worst, removal_diags)
             processed: [(处理后的 RGBA 图, 抠背景是否成功)]
             durations: 每帧时长 ms
             file_info: 每个文件的元信息 {name, data, start, count, size}
             verdicts:  每帧的分析结果
             worst:     得分最低的分析结果
+            removal_diags: 每帧的抠图完整度/自动应用诊断
         """
         processed: list[tuple[Image.Image, bool]] = []  # (处理后图, 抠背景是否成功)
+        removal_diags: list[RemovalDiagnostics] = []
         durations: list[int] = []
         file_info: list[dict] = []   # 每个文件: {name, data, frames 区间, 帧数}
 
@@ -405,13 +429,25 @@ class CursorApp:
                 from pointer_analyzer import estimate_background_color
                 bg_hint = estimate_background_color(file_frames[0])
                 for img in file_frames:
-                    out, ok = auto_remove_background(
-                        img, keep_existing_alpha=True, bg_hint=bg_hint,
-                        allow_mostly_background=True)
+                    out, ok, diag = auto_remove_background(
+                        img,
+                        keep_existing_alpha=True,
+                        bg_hint=bg_hint,
+                        allow_mostly_background=n_frames > 1,
+                        quality_size=self.canvas_size,
+                        return_diagnostics=True,
+                    )
                     processed.append((out, ok))
+                    removal_diags.append(diag)
             else:
                 for img in file_frames:
-                    processed.append((img, True))
+                    out, ok, diag = auto_remove_background(
+                        img,
+                        quality_size=self.canvas_size,
+                        return_diagnostics=True,
+                    )
+                    processed.append((out, ok))
+                    removal_diags.append(diag)
             durations.extend(file_durations)
             file_info.append({
                 "name": _name,
@@ -428,11 +464,63 @@ class CursorApp:
             removal = None if has_alpha else bg_ok
             verdicts.append(analyze(img, removal_ok=removal))
         worst = min(verdicts, key=lambda a: a.score)
-        return processed, durations, file_info, verdicts, worst
+        return processed, durations, file_info, verdicts, worst, removal_diags
+
+    @staticmethod
+    def _quality_summary(worst, removal_diags: list[RemovalDiagnostics]) -> dict:
+        """合并适合度与抠图完整度；抠图低置信度永远不能静默自动应用。"""
+        rank = {"low": 0, "medium": 1, "high": 2}
+        confidence = min(
+            (diag.confidence for diag in removal_diags),
+            key=lambda value: rank.get(value, 0),
+            default="low",
+        )
+        representative = min(
+            removal_diags,
+            key=lambda diag: (
+                rank.get(diag.confidence, 0),
+                -diag.postfill_removed_ratio,
+                -len(diag.issues),
+            ),
+            default=None,
+        )
+        issues = [{"level": issue.level, "code": issue.code, "message": issue.message}
+                  for issue in worst.issues]
+        seen_codes = {item.get("code") for item in issues}
+        for diag in removal_diags:
+            for issue in diag.issues:
+                if issue.code not in seen_codes:
+                    issues.append({"level": issue.level, "code": issue.code,
+                                   "message": issue.message})
+                    seen_codes.add(issue.code)
+
+        verdict = worst.verdict
+        score = worst.score
+        if confidence == "low":
+            verdict = "不适合"
+            score = min(score, 39)
+        elif confidence == "medium" and verdict == "适合":
+            verdict = "有风险"
+            score = min(score, 69)
+        auto_apply = (
+            confidence == "high"
+            and verdict == "适合"
+            and all(diag.auto_apply for diag in removal_diags)
+        )
+        return {
+            "verdict": verdict,
+            "score": score,
+            "issues": issues,
+            "removal_confidence": confidence,
+            "auto_apply": auto_apply,
+            "removal_diagnostics": representative.as_dict() if representative else None,
+        }
 
     def upload(self, file_items: list[tuple[str, bytes]]) -> dict:
         import datetime
-        processed, durations, file_info, verdicts, worst = self._process_files(file_items)
+        (processed, durations, file_info, verdicts, worst,
+         removal_diags) = self._process_files(file_items)
+        quality = self._quality_summary(worst, removal_diags)
 
         # 统一缩放到画布尺寸
         frames = []
@@ -444,9 +532,12 @@ class CursorApp:
             self.frames = frames
             self.durations = durations[: len(frames)]
             self.hotspot = analyze(frames[0], target_size=self.canvas_size).hotspot
-            self.verdict = worst.verdict
-            self.score = worst.score
-            self.issues = [{"level": i.level, "message": i.message} for i in worst.issues]
+            self.verdict = quality["verdict"]
+            self.score = quality["score"]
+            self.issues = quality["issues"]
+            self.removal_confidence = quality["removal_confidence"]
+            self.auto_apply_allowed = quality["auto_apply"]
+            self.removal_diagnostics = quality["removal_diagnostics"]
             self.src_size = (processed[0][0].width, processed[0][0].height)
 
         # ── 存储: 上传原图 + 生成的光标快照 ──
@@ -463,13 +554,15 @@ class CursorApp:
             # 该文件的综合结论（取其帧中最低分）
             f_verdicts = verdicts[fi["start"]: fi["start"] + fi["count"]]
             f_worst = min(f_verdicts, key=lambda a: a.score) if f_verdicts else worst
+            f_diags = removal_diags[fi["start"]: fi["start"] + fi["count"]]
+            f_quality = self._quality_summary(f_worst, f_diags)
             # 缩略图: 用该文件处理后首帧
             first_img = processed[fi["start"]][0]
             thumb = self._make_thumb(first_img, 128)
             entry = self.store.add_upload(
                 fi["name"], fi["data"], thumb,
                 {"created": now, "size": fi["size"],
-                 "verdict": f_worst.verdict, "score": f_worst.score,
+                 "verdict": f_quality["verdict"], "score": f_quality["score"],
                  "sha256": sha},
             )
             upload_ids.append(entry["id"])
@@ -515,9 +608,12 @@ class CursorApp:
             "frames": len(frames),
             "canvas_size": self.canvas_size,
             "hotspot": list(self.hotspot),
-            "verdict": worst.verdict,
-            "score": worst.score,
+            "verdict": quality["verdict"],
+            "score": quality["score"],
             "issues": self.issues,
+            "removal_confidence": quality["removal_confidence"],
+            "auto_apply": quality["auto_apply"],
+            "removal_diagnostics": quality["removal_diagnostics"],
             "src_size": list(self.src_size),
             "previews": previews,
             "hard_reject": hard_reject,
@@ -540,30 +636,11 @@ class CursorApp:
         scale = min(size / img.width, size / img.height, 1.0)
         w = max(1, round(img.width * scale))
         h = max(1, round(img.height * scale))
-        canvas.paste(img.resize((w, h), Image.LANCZOS),
-                     ((size - w) // 2, (size - h) // 2))
+        scaled = _resize_rgba_premultiplied(img, (w, h))
+        canvas.alpha_composite(scaled, dest=((size - w) // 2, (size - h) // 2))
         buf = io.BytesIO()
         canvas.save(buf, format="PNG")
         return buf.getvalue()
-
-        # 预览: 每帧 4x 放大 PNG → base64
-        previews = self.previews()
-
-        hard_reject = any(
-            it.level == "error" and it.code in HARD_REJECT_CODES for it in worst.issues
-        )
-
-        return {
-            "frames": len(frames),
-            "canvas_size": self.canvas_size,
-            "hotspot": list(self.hotspot),
-            "verdict": worst.verdict,
-            "score": worst.score,
-            "issues": self.issues,
-            "src_size": list(self.src_size),
-            "previews": previews,
-            "hard_reject": hard_reject,
-        }
 
     def generate_from_upload(self, uid: str) -> dict:
         """从图库中已保存的图片生成光标（复用上传分析流程，不重复入库图片）。
@@ -594,6 +671,9 @@ class CursorApp:
                 self.src_size = (frames[0].width, frames[0].height)
                 self.verdict = self.score = None
                 self.issues = []
+                self.removal_confidence = "high"
+                self.auto_apply_allowed = True
+                self.removal_diagnostics = None
                 self.last_cursor_id = existing["id"]
             return {
                 "existing": True,
@@ -603,6 +683,9 @@ class CursorApp:
                 "verdict": "适合",
                 "score": 100,
                 "issues": [],
+                "removal_confidence": "high",
+                "auto_apply": True,
+                "removal_diagnostics": None,
                 "src_size": list(self.src_size),
                 "previews": self.previews(),
                 "hard_reject": False,
@@ -612,8 +695,9 @@ class CursorApp:
             }
 
         import datetime
-        processed, durations, _file_info, verdicts, worst = self._process_files(
-            [(entry["original"], data)])
+        (processed, durations, _file_info, verdicts, worst,
+         removal_diags) = self._process_files([(entry["original"], data)])
+        quality = self._quality_summary(worst, removal_diags)
 
         # 统一缩放到画布尺寸
         frames = [self._fit_to_canvas(img, self.canvas_size) for img, _bg in processed]
@@ -622,9 +706,12 @@ class CursorApp:
             self.frames = frames
             self.durations = durations[: len(frames)]
             self.hotspot = analyze(frames[0], target_size=self.canvas_size).hotspot
-            self.verdict = worst.verdict
-            self.score = worst.score
-            self.issues = [{"level": i.level, "message": i.message} for i in worst.issues]
+            self.verdict = quality["verdict"]
+            self.score = quality["score"]
+            self.issues = quality["issues"]
+            self.removal_confidence = quality["removal_confidence"]
+            self.auto_apply_allowed = quality["auto_apply"]
+            self.removal_diagnostics = quality["removal_diagnostics"]
             self.src_size = (processed[0][0].width, processed[0][0].height)
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -664,9 +751,12 @@ class CursorApp:
             "frames": len(frames),
             "canvas_size": self.canvas_size,
             "hotspot": list(self.hotspot),
-            "verdict": worst.verdict,
-            "score": worst.score,
+            "verdict": quality["verdict"],
+            "score": quality["score"],
             "issues": self.issues,
+            "removal_confidence": quality["removal_confidence"],
+            "auto_apply": quality["auto_apply"],
+            "removal_diagnostics": quality["removal_diagnostics"],
             "src_size": list(self.src_size),
             "previews": self.previews(),
             "hard_reject": hard_reject,
@@ -699,7 +789,9 @@ class CursorApp:
             self.canvas_size = size
             if self.frames and size != old:
                 scale = size / old
-                self.frames = [f.resize((size, size), Image.LANCZOS) for f in self.frames]
+                self.frames = [
+                    _resize_rgba_premultiplied(f, (size, size)) for f in self.frames
+                ]
                 self.hotspot = (
                     min(size - 1, round(self.hotspot[0] * scale)),
                     min(size - 1, round(self.hotspot[1] * scale)),
@@ -745,9 +837,11 @@ class CursorApp:
         scale = min(size / img.width, size / img.height, 1.0)
         new_w = max(1, round(img.width * scale))
         new_h = max(1, round(img.height * scale))
-        scaled = img.resize((new_w, new_h), Image.LANCZOS)
+        scaled = _resize_rgba_premultiplied(img, (new_w, new_h))
         canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        canvas.paste(scaled, ((size - new_w) // 2, (size - new_h) // 2), scaled)
+        # paste(..., mask=scaled) 会把半透明边缘的 alpha 再乘一次；alpha_composite
+        # 只应用一次源 alpha，避免细腿/毛发在最终 48/64/96px 画布上继续变淡。
+        canvas.alpha_composite(scaled, dest=((size - new_w) // 2, (size - new_h) // 2))
         return canvas
 
     # ── 生成 / 应用 / 恢复 ─────────────────────────────
@@ -801,6 +895,9 @@ class CursorApp:
                 "verdict": self.verdict,
                 "score": self.score,
                 "issues": self.issues,
+                "removal_confidence": self.removal_confidence,
+                "auto_apply": self.auto_apply_allowed,
+                "removal_diagnostics": self.removal_diagnostics,
                 "src_size": list(self.src_size) if self.src_size else None,
                 "data_dir": self.store.root,
                 "last_cursor_id": self.last_cursor_id,
@@ -851,6 +948,9 @@ class CursorApp:
             self.src_size = (frames[0].width, frames[0].height)
             self.verdict = self.score = None
             self.issues = []
+            self.removal_confidence = "high"
+            self.auto_apply_allowed = True
+            self.removal_diagnostics = None
             self.last_cursor_id = cid
             self.mgr.replace_cursor(ani_path)
             self.enabled = True
@@ -920,6 +1020,9 @@ class CursorApp:
         self.verdict = None
         self.score = None
         self.issues = []
+        self.removal_confidence = None
+        self.auto_apply_allowed = False
+        self.removal_diagnostics = None
         self.src_size = None
         self.last_cursor_id = None
 
