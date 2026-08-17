@@ -67,6 +67,31 @@ python custom_cursor_gui.pyw
 Run `dist\CustomCursorController.exe` — double-click to enter the GUI.
 运行 `dist\CustomCursorController.exe` —— 双击进入图形界面。
 
+### Protected build / 受保护构建（PyArmor 混淆）
+
+Plain PyInstaller packages contain readable Python bytecode; to raise the reverse-engineering
+bar, this branch adds a PyArmor-based protected build:
+
+```bash
+pip install -r requirements-build.txt   # pyinstaller + pyarmor
+python build.py                         # 混淆全部核心脚本 → PyInstaller 打包
+```
+
+The output is still `dist\CustomCursorController.exe`. Source files stay untouched and are
+only obfuscated into the temporary `.pyarmor/pack/dist` during the build.
+
+> **License note / 许可证说明** — PyArmor 试用版 cannot obfuscate large scripts
+> (`gui_server.py` / `pointer_analyzer.py`), so a paid/trial license with that limit
+> lifted is required. Register one before building:
+> `pyarmor reg -p non-profits pyarmor-regcode-xxx.txt`
+
+普通 PyInstaller 产物里是可直接提取的 Python 字节码；本分支提供基于 PyArmor 的受保护构建，
+先混淆全部核心脚本再走现有 spec 打包，产物仍在 `dist\CustomCursorController.exe`。
+源码本身保持不变，只在构建期写入临时目录 `.pyarmor/pack/dist`。
+
+> 注意：PyArmor 试用版无法混淆大脚本（`gui_server.py` / `pointer_analyzer.py`），
+> 需要先注册正式许可证：`pyarmor reg -p non-profits pyarmor-regcode-xxx.txt`
+
 ---
 
 ## 🖱️ Usage / 使用方法（Web GUI）
