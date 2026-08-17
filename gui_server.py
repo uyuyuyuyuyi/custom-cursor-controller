@@ -183,6 +183,10 @@ class CursorStore:
         os.makedirs(self.cursors_dir, exist_ok=True)
         self.index_path = os.path.join(self.root, "index.json")
         self.index: dict = {"uploads": {}, "cursors": {}}
+        # 写锁(可重入): 索引 dict 的修改与 _save 的 json.dump/os.replace
+        # 必须在同一把锁内, 否则并发上传时 dump 遍历与插入交错,
+        # 轻则 RuntimeError, 重则交错写同一 tmp 文件损坏索引。
+        self._io_lock = threading.RLock()
         self._load()
 
     def _resolve_root(self) -> str:
@@ -237,10 +241,11 @@ class CursorStore:
             self._save()
 
     def _save(self) -> None:
-        tmp = self.index_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.index, f, ensure_ascii=False)
-        os.replace(tmp, self.index_path)
+        with self._io_lock:
+            tmp = self.index_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.index, f, ensure_ascii=False)
+            os.replace(tmp, self.index_path)
 
     # ── 上传 ──────────────────────────────────────────
     def add_upload(self, original_name: str, data: bytes,
@@ -267,8 +272,9 @@ class CursorStore:
             "score": meta.get("score", 0),
             "sha256": meta.get("sha256", ""),
         }
-        self.index["uploads"][uid] = entry
-        self._save()
+        with self._io_lock:
+            self.index["uploads"][uid] = entry
+            self._save()
         return entry
 
     def find_upload_by_sha(self, sha256: str) -> dict | None:
@@ -307,8 +313,9 @@ class CursorStore:
             "upload_ids": meta.get("upload_ids", []),
             "source_hashes": sorted(meta.get("source_hashes", [])),
         }
-        self.index["cursors"][cid] = entry
-        self._save()
+        with self._io_lock:
+            self.index["cursors"][cid] = entry
+            self._save()
         return entry
 
     def find_cursor_by_sources(self, source_hashes: list[str]) -> dict | None:
@@ -375,42 +382,45 @@ class CursorStore:
         return self.index["cursors"].get(cid)
 
     def rename_cursor(self, cid: str, name: str) -> dict:
-        entry = self.index["cursors"].get(cid)
-        if not entry:
-            raise KeyError("光标不存在")
-        entry["name"] = _sanitize_name(name, "光标")
-        self._save()
+        with self._io_lock:
+            entry = self.index["cursors"].get(cid)
+            if not entry:
+                raise KeyError("光标不存在")
+            entry["name"] = _sanitize_name(name, "光标")
+            self._save()
         return entry
 
     def set_category(self, kind: str, uid: str, category: str) -> dict:
-        table = self.index.get(kind)
-        if not table or uid not in table:
-            raise KeyError("条目不存在")
-        table[uid]["category"] = _sanitize_name(category, "")
-        self._save()
+        with self._io_lock:
+            table = self.index.get(kind)
+            if not table or uid not in table:
+                raise KeyError("条目不存在")
+            table[uid]["category"] = _sanitize_name(category, "")
+            self._save()
         return table[uid]
 
     def delete(self, kind: str, uid: str) -> None:
-        table = self.index.get(kind)
-        if not table or uid not in table:
-            raise KeyError("条目不存在")
-        entry = table.pop(uid)
-        self._save()
-        # 删除关联文件（尽力而为）
-        try:
-            if kind == "uploads":
-                for rel in (entry["filename"], entry["thumb"]):
-                    p = os.path.join(self.root, rel)
-                    if os.path.exists(p):
-                        os.remove(p)
-            else:
-                folder = os.path.join(self.cursors_dir, uid)
-                if os.path.isdir(folder):
-                    for fn in os.listdir(folder):
-                        os.remove(os.path.join(folder, fn))
-                    os.rmdir(folder)
-        except OSError:
-            pass
+        with self._io_lock:
+            table = self.index.get(kind)
+            if not table or uid not in table:
+                raise KeyError("条目不存在")
+            entry = table.pop(uid)
+            self._save()
+            # 删除关联文件（尽力而为）
+            try:
+                if kind == "uploads":
+                    for rel in (entry["filename"], entry["thumb"]):
+                        p = os.path.join(self.root, rel)
+                        if os.path.exists(p):
+                            os.remove(p)
+                else:
+                    folder = os.path.join(self.cursors_dir, uid)
+                    if os.path.isdir(folder):
+                        for fn in os.listdir(folder):
+                            os.remove(os.path.join(folder, fn))
+                        os.rmdir(folder)
+            except OSError:
+                pass
 
 
 class CursorApp:
@@ -1357,8 +1367,18 @@ def make_handler(app: CursorApp, webui_dir: str | None):
             if path in ("/", ""):
                 path = "/index.html"
             rel = path.lstrip("/").replace("\\", "/")
+            # 纵深防御: 拒绝 URL 编码的分隔符 (%2f=%2F 斜杠, %5c=%5C 反斜杠),
+            # 防止经代理/客户端二次解码后逃逸出 webui_dir。
+            if "%2f" in rel.lower() or "%5c" in rel.lower():
+                self._send_error(403, "禁止访问")
+                return
+            root = os.path.normpath(webui_dir)
             target = os.path.normpath(os.path.join(webui_dir, rel))
-            if not target.startswith(os.path.normpath(webui_dir)):
+            try:
+                inside = os.path.commonpath([root, target]) == root
+            except ValueError:  # 不同盘符等无法比较的情况
+                inside = False
+            if not inside:
                 self._send_error(403, "禁止访问")
                 return
             if not os.path.isfile(target):
