@@ -24,10 +24,10 @@ test_*.cur
 # Preview images
 *_preview.png
 
-# PyArmor (构建期混淆，产物不入库)
-.pyarmor/
-.pyarmor_home/
-*.patched.spec
+# Nuitka (编译期产物不入库)
+*.build/
+*.dist/
+*.onefile-build/
 
 # Runtime generated resources (程序首次运行自动生成)
 resources/
