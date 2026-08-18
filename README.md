@@ -20,7 +20,7 @@ Programmatically built `.ani` files (pure Python), image analysis & background r
 | 🎞️ **GIF 动画支持**：多帧提取、保留原始帧时长、动画预览轮播 | **Animated GIF support**: multi-frame extraction, original frame durations kept, live preview loop |
 | ✨ **可选 AI 智能抠图**：一键 ONNX 抠图（模型首次使用才下载、不入安装包；Apache-2.0 可商用） | **Optional ONNX AI cutout**: one-click background removal (model lazy-downloaded on first use, never bundled; Apache-2.0, commercial-friendly) |
 | 🔄 **自动替换**：上传新图片自动生成新光标并替换系统光标 + 弹窗提示 | **Auto-swap**: a new upload auto-generates and replaces the cursor, with a popup notice |
-| 🎯 点击预览设置**热点**；↺/↻ **旋转 90°**；**光标大小** 48/64/96 可选 | Click-to-set **hotspot**; ↺/↻ **rotate 90°**; **cursor size** 48/64/96 selectable |
+| 🎯 点击预览设置**热点**；↺/↻ **旋转 90°**；**画布大小** 48/64/96 + **实际显示大小滑动条** 32~256（16px 一档，实时生效） | Click-to-set **hotspot**; ↺/↻ **rotate 90°**; **canvas size** 48/64/96 + **actual display size slider** 32–256 (16px steps, live) |
 | 🗂 **图库**：所有上传图片与生成光标存于 `C:\Program Files\custom-cursor-controller\data\`，可查看 / 应用 / 重命名 / 归类 / 删除 | **Gallery**: all uploads & cursors stored in `C:\Program Files\custom-cursor-controller\data\`, view / apply / rename / categorize / delete |
 | 🔍 **内容查重**（SHA-256）：重复上传相同内容时提示，可选择取消（自动清理） | **Content dedup** (SHA-256): duplicate uploads are flagged; cancel auto-cleans the new copies |
 | 🪳 经典蟑螂光标是项目的起源（现已演化为通用控制器） | The classic cockroach cursor is where the project started (now a general-purpose controller) |
@@ -81,10 +81,11 @@ fp32/uint8；SHA-256 校验），
 Run `dist\CustomCursorController.exe` — double-click to enter the GUI.
 运行 `dist\CustomCursorController.exe` —— 双击进入图形界面。
 
-### Protected build / 受保护构建（Nuitka 编译）
+### Protected build / 受保护构建（Nuitka 编译，可选）
 
-Plain PyInstaller packages contain readable Python bytecode; this branch instead compiles the
-whole program to native code with Nuitka, which makes reverse-engineering significantly harder:
+Plain PyInstaller packages contain readable Python bytecode; if you want stronger protection,
+you can instead compile the whole program to native code with Nuitka, which makes
+reverse-engineering significantly harder:
 
 ```bash
 pip install -r requirements-build.txt   # pyinstaller + nuitka
@@ -108,7 +109,7 @@ auto-detects Visual Studio Build Tools (fallback: `--mingw64` downloads MinGW au
 1. **上传图片**：拖拽到上传区或点击选择（PNG/JPG/BMP/GIF/WebP，多选 = 动画帧；单个 GIF = 动画）。
 2. **适合度判断**：程序分析并给出"适合 / 有风险 / 不适合"结论与原因；有风险或不适合时弹窗确认（硬性不合格如空白图不可强制）。
 3. **自动生效**：判断通过后自动生成新光标并替换系统箭头，弹窗提示"已自动替换为新光标「名称」"。
-4. **调整**：点击预览图设置热点（点击点位置）；↺/↻ 旋转 90°；光标大小 48/64/96 即时切换（已启用时立即重新生效）。
+4. **调整**：点击预览图设置热点（点击点位置）；↺/↻ 旋转 90°；画布大小 48/64/96 即时切换；「实际大小」滑动条 32~256（16px 一档）实时改变系统光标的实际显示尺寸（已启用时立即生效）。
 5. **开关**：勾选"启用自定义光标"生效，取消勾选恢复默认；"恢复默认光标"随时还原。
 6. **图库**：切到「图库」页签查看所有上传的图片与生成的光标——可**应用**（恢复该光标并替换系统）、**重命名**、**归类**（自由文本分类）、**删除**。
 7. **查重**：上传与已存图片/光标内容相同（SHA-256）时会提示，选择"确定"生成副本或"取消"（自动清理本次内容）。
@@ -123,11 +124,13 @@ auto-detects Visual Studio Build Tools (fallback: `--mingw64` downloads MinGW au
 ```bash
 pip install pyinstaller
 
-# Web GUI / Web 版（推荐）
-pyinstaller CustomCursorController.spec --noconfirm        # → dist\CustomCursorController.exe
+# Web GUI / Web 版（推荐；使用与源码相同的 Python 环境执行）
+python -m PyInstaller CustomCursorController.spec --noconfirm   # → dist\CustomCursorController.exe
 ```
 
 > Web 版打包前需先构建前端：`cd webui && npm install && npm run build`（产物在 `webui/dist`，已随打包内嵌）。
+> spec 已排除 `torch`、`scipy`、`pandas`、`matplotlib` 等 AI 环境里用不到的重量级依赖（onnxruntime
+> 的调试子模块会静态引入它们，不排除会把单文件包从 ~46MB 撑到 ~250MB）。请勿把这些依赖重新加回。
 
 ---
 
@@ -149,17 +152,25 @@ custom-cursor-controller/
 │                          # 可选 ONNX 智能抠图：懒下载 + 懒加载（Apache-2.0 模型，可商用）
 ├── ani_builder.py         # Pure-Python RIFF/ACON (.ani) binary builder
 │                          # 纯 Python 的 RIFF/ACON (.ani) 二进制构建器
-├── test_web_api.py        # End-to-end API tests (102 checks, incl. real cursor swap)
-│                          # API 端到端测试（102 项，含真实光标替换）
+├── AGENTS.md              # Agent / 跨设备交接说明（新设备上的 agent 先读这个）
+│                          # Handover & agent onboarding notes for new devices
+├── test_web_api.py        # End-to-end API tests (118 checks, incl. real cursor swap)
+│                          # API 端到端测试（118 项，含真实光标替换）
 ├── test_image_quality.py  # Real-image mask/alpha quality regressions (no cursor swap)
 │                          # 真实图片抠图/Alpha 质量回归（不会替换系统光标）
 ├── test_onnx_cutout.py    # ONNX cutout unit tests (fake session; no network/cursor swap)
 │                          # ONNX 抠图单元测试（假会话；无网络、不碰系统光标）
+├── test_path_traversal.py / test_concurrent_save.py  # path traversal & concurrent save regressions
+│                          # 路径穿越与并发索引写入回归测试
+├── build.py               # Nuitka protected build script (optional; PyInstaller spec is the default)
+│                          # Nuitka 受保护构建脚本（可选；默认用 PyInstaller spec）
 ├── CustomCursorController.spec  # PyInstaller spec (embeds webui/dist)
 │                          # 打包配置（内嵌前端）
 ├── requirements.txt       # pystray + Pillow + pywebview + pythonnet
 ├── requirements-ai.txt    # Optional AI deps: onnxruntime + numpy
 │                          # 可选 AI 依赖：onnxruntime + numpy
+├── requirements-build.txt # Build deps: pyinstaller + nuitka
+│                          # 打包依赖：pyinstaller + nuitka
 ├── data/                  # User data (created at runtime): uploads/ + cursors/ + index.json
 │                          # 用户数据（运行时创建，默认位于 C:\Program Files\custom-cursor-controller\data\）
 └── dist/                  # Build output: CustomCursorController.exe
@@ -176,8 +187,8 @@ custom-cursor-controller/
 2. **Format / 格式** — `ani_builder.py` hand-writes the RIFF `ACON` structure: `anih` header, `rate` chunk (ms → jiffies at 1/60 s), `fram` LIST with one PNG-compressed `.cur` per frame, optional `INFO` metadata, with WORD alignment.
    `ani_builder.py` 手工拼写 RIFF `ACON` 结构：`anih` 头、`rate` 块（毫秒换算为 1/60s 的 jiffy）、`fram` LIST（每帧一个 PNG 压缩的 `.cur`）、可选 `INFO` 元数据，含 WORD 对齐。
 
-3. **Install / 注入** — `LoadCursorFromFileW` → `SetSystemCursor` swaps `OCR_NORMAL`; the original cursor is backed up via `CopyImage` and restored with `SetSystemCursor` + a `SPI_SETCURSORS`/`SPIF_SENDCHANGE` broadcast so every window (including Explorer) reloads the cursor scheme.
-   通过 `LoadCursorFromFileW` → `SetSystemCursor` 替换 `OCR_NORMAL`；原始光标用 `CopyImage` 备份，恢复时执行 `SetSystemCursor` 并广播 `SPI_SETCURSORS`/`SPIF_SENDCHANGE`，让所有窗口（含资源管理器）重新加载光标方案。
+3. **Install / 注入** — `LoadImageW`（显式目标尺寸）→ `SetSystemCursor` swaps `OCR_NORMAL`. Do **not** switch back to `LoadCursorFromFileW`: on this Windows session it scales every cursor file to the current system pointer size (32/48px), which makes the actual-size slider appear broken. Registry `CursorBaseSize` / `Accessibility\CursorSize` are persisted for future sessions only (`SPI_SETCURSORS` does not recompute scaling). The original cursor is backed up via `CopyImage` and restored with `SetSystemCursor` + a `SPI_SETCURSORS`/`SPIF_SENDCHANGE` broadcast so every window (including Explorer) reloads the cursor scheme.
+   通过 `LoadImageW`（显式目标尺寸）→ `SetSystemCursor` 替换 `OCR_NORMAL`；不要改回 `LoadCursorFromFileW`——它会按当前系统指针大小把所有尺寸的光标缩到 32/48px，导致“实际大小”滑动条无效。注册表 `CursorBaseSize` / `Accessibility\CursorSize` 仅持久化，`SPI_SETCURSORS` 不会重算缩放。原始光标用 `CopyImage` 备份，恢复时执行 `SetSystemCursor` 并广播 `SPI_SETCURSORS`/`SPIF_SENDCHANGE`，让所有窗口（含资源管理器）重新加载光标方案。
 
 4. **Storage / 存储** — every upload and generated cursor is snapshotted into `data/` (originals + thumbs + `.ani` + per-frame PNGs + `index.json`), enabling the gallery (view/apply/rename/categorize/delete) and SHA-256 content dedup.
    每次上传的图片与生成的光标都会快照到 `data/`（原图+缩略图+.ani+每帧 PNG+index.json），支撑图库（查看/应用/重命名/归类/删除）与 SHA-256 内容查重。
@@ -190,8 +201,8 @@ custom-cursor-controller/
   仅调用 `SetSystemCursor` 时资源管理器可能缓存旧光标；程序恢复后总会广播 `SPI_SETCURSORS`。若光标仍异常，注销重登或重启资源管理器。
 - **Administrator rights / 管理员权限** — normal user rights are sufficient for the current user's cursor; no elevation needed.
   替换当前用户的光标无需管理员权限。
-- **Cursor size & DPI / 光标大小与缩放** — the GUI offers 48/64/96 px; on high-DPI displays pick a larger size for better visibility.
-  GUI 提供 48/64/96 可选；高 DPI 屏幕建议选更大尺寸。
+- **Cursor size & DPI / 光标大小与缩放** — the GUI offers canvas sizes 48/64/96 px plus an **actual display size slider** (32–256 px, 16px steps) that changes the real system cursor immediately; on high-DPI displays pick a larger value for better visibility.
+  GUI 提供画布大小 48/64/96，以及「实际大小」滑动条（32~256px，16px 一档），可实时改变系统光标的真实尺寸；高 DPI 屏幕建议选更大值。
 - **Suitability check is heuristic / 适合度判断是启发式** — it reliably rejects obviously unsuitable images but cannot judge aesthetics; the user keeps the final say (force-use allowed).
   适合度判断能可靠拦截明显不合适的图片，但无法评判美观性——用户保留最终决定权（可强制使用）。
 - **Onefile startup / 单文件版启动** — the single-file exe unpacks runtime DLLs to a temp dir on start; if an antivirus blocks it, use the folder build.
@@ -201,8 +212,10 @@ custom-cursor-controller/
 
 ## 🧪 Tests / 自测脚本
 
-- `python test_web_api.py` — end-to-end API tests: upload/analyze/apply/restore, rotate & size, gallery CRUD, content dedup, GIF multi-frame + white-background consistency, AI status/cutout gating (102 checks, briefly swaps the real cursor).
-  端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性、AI 状态与任务门控（102 项，会短暂替换真实光标）。
+- `python test_web_api.py` — end-to-end API tests: upload/analyze/apply/restore, rotate & size, gallery CRUD, content dedup, GIF multi-frame + white-background consistency, AI status/cutout gating, actual-size slider clamping (118 checks, briefly swaps the real cursor).
+  端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性、AI 状态与任务门控、实际大小滑动条钳制（118 项，会短暂替换真实光标）。
+- `python test_path_traversal.py`、`python test_concurrent_save.py` — path-traversal and concurrent index-save regressions.
+  路径穿越与并发索引写入回归测试。
 - `python -m unittest -v test_image_quality.py` — real `test_res` confidence routing, destructive-postfill rollback, and premultiplied-alpha regressions; does not touch the system cursor.
   真实 `test_res` 可信度路由、破坏性补抠回退与预乘 Alpha 回归测试；不会替换系统光标。
 - `python -m unittest -v test_onnx_cutout.py` — ONNX model metadata, fake-session inference, alpha compositing and graceful-degradation tests; no network, no cursor swap.
