@@ -12,6 +12,8 @@ API:
   POST /api/apply          用已暂存帧生成 .ani 并替换系统光标
   POST /api/restore        恢复系统默认光标
   POST /api/hotspot        {x, y} 设置热点，启用中则立即重新生效
+  GET  /api/ai/status      可选 ONNX 智能抠图的状态（依赖/模型/任务进度）
+  POST /api/ai/cutout      用 ONNX 模型对当前帧重新抠图（后台任务）
   POST /api/quit           恢复光标并退出程序（关闭窗口时调用）
   GET  /                   静态前端 (webui/dist)
 """
@@ -34,11 +36,19 @@ from urllib.parse import unquote, urlparse
 from PIL import Image, ImageChops, ImageFilter
 
 from ani_builder import build_ani_file, save_ani_file
+from onnx_cutout import (
+    LazyOnnxSegmenter,
+    ModelDownloadError,
+    OnnxNotInstalledError,
+    composite_alpha,
+)
 from pointer_analyzer import (
     HARD_REJECT_CODES,
+    Issue,
     RemovalDiagnostics,
     analyze,
     auto_remove_background,
+    diagnose_alpha_mask,
 )
 from cursor_manager import CursorManager
 
@@ -46,6 +56,11 @@ CANVAS_SIZE = 48            # 旧默认（兼容引用）
 DEFAULT_CANVAS_SIZE = 64    # 光标画布尺寸（可在界面选择 48/64/96）
 FRAME_MS = 150              # 默认帧时长
 SIZE_CHOICES = (32, 48, 64, 96, 128)
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024   # 上传内容长度上限 64MB
+MAX_IMAGE_PIXELS = 50_000_000         # PIL 解压炸弹阈值（约 2 倍后抛错）
+
+# 解压炸弹防护: 超出像素上限的图片直接拒绝（PIL 默认仅警告）
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
 def _resize_rgba_premultiplied(
@@ -109,6 +124,89 @@ def _subject_crop_box(frames: list[Image.Image]) -> tuple[int, int, int, int] | 
     my = max(1, round((bottom - top) * CROP_MARGIN))
     return (max(0, left - mx), max(0, top - my),
             min(fw, right + mx), min(fh, bottom + my))
+
+
+def _extract_animation_frames(
+    src: Image.Image,
+) -> tuple[list[Image.Image], list[int]]:
+    """提取动画的全部帧与帧时长。
+
+    GIF 帧的 disposal 方法(0=保留/1=不清理/2=恢复背景/3=恢复到先前帧)
+    决定"本帧透明像素之下显示什么"。Pillow 的 seek() 不自动合成这些
+    增量帧(实测 Pillow 12 亦然), 这里手动逐帧合成到累积画布, 避免
+    动画帧缺内容/残影。disposal=3 按"恢复到上一帧"近似(规范中
+    指更早的未清理帧, 实际 GIF 中极罕见)。
+    """
+    n = getattr(src, "n_frames", 1)
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+    if n <= 1:
+        return [src.convert("RGBA")], [FRAME_MS]
+
+    def _dur() -> int:
+        d = int(src.info.get("duration", FRAME_MS) or FRAME_MS)
+        return max(20, min(2000, d))
+
+    if src.format == "GIF":
+        canvas: Image.Image | None = None
+        prev_frame: Image.Image | None = None
+        prev_disposal = 0
+        prev_extent: tuple[int, int, int, int] | None = None
+        for i in range(n):
+            src.seek(i)
+            rgba = src.convert("RGBA")
+            if canvas is None:
+                canvas = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+            else:
+                if prev_disposal in (2, 3):
+                    # 恢复背景(2): 上一帧区域清空为透明;
+                    # 恢复到先前帧(3): 上一帧区域恢复为上一帧内容(近似)。
+                    # 首帧无 dispose_extent 时按规范默认为整幅画布。
+                    x0, y0, x1, y1 = prev_extent or (0, 0, canvas.width, canvas.height)
+                    if prev_disposal == 3 and prev_frame is not None:
+                        region = prev_frame.crop((x0, y0, x1, y1))
+                        canvas.paste(region, (x0, y0))
+                    else:
+                        canvas.paste((0, 0, 0, 0), (x0, y0, x1, y1))
+            # 当前帧叠到画布上: 透明像素透出下层内容
+            canvas.alpha_composite(rgba)
+            prev_frame = rgba.copy()
+            prev_disposal = int(getattr(src, "disposal_method", 0) or 0)
+            prev_extent = getattr(src, "dispose_extent", None)
+            frames.append(canvas.copy())
+            durations.append(_dur())
+    else:
+        # WebP/APNG 等多帧格式由解码器自行合成, 直接取帧
+        for i in range(n):
+            src.seek(i)
+            frames.append(src.convert("RGBA"))
+            durations.append(_dur())
+    return frames, durations
+
+
+def _pick_bg_hint_frame(frames: list[Image.Image]) -> Image.Image:
+    """选一帧"边框大部分不透明"的帧做背景色估计。
+
+    透明像素的 RGB 是调色板残留的垃圾值: 若首帧边框全透明(常见于
+    带透明首帧的 GIF), 估出的"背景色"会污染整组帧的抠图。因此跳过
+    边框透明的帧, 全都不满足时才退回首帧(行为同旧版)。
+    """
+    for f in frames:
+        w, h = f.size
+        if w < 2 or h < 2:
+            return f
+        alpha = f.getchannel("A")
+        border_len = 2 * w + 2 * (h - 2)
+        opaque = 0
+        for x in range(w):
+            opaque += alpha.getpixel((x, 0)) > 250
+            opaque += alpha.getpixel((x, h - 1)) > 250
+        for y in range(1, h - 1):
+            opaque += alpha.getpixel((0, y)) > 250
+            opaque += alpha.getpixel((w - 1, y)) > 250
+        if opaque >= border_len * 0.3:
+            return f
+    return frames[0]
 
 
 # 静态前端目录: 源码运行时在 webui/dist，打包后在 _MEIPASS/webui
@@ -318,6 +416,41 @@ class CursorStore:
             self._save()
         return entry
 
+    def refresh_cursor(self, cid: str, ani_bytes: bytes, preview_png: bytes,
+                       frames_png: list[bytes], meta_updates: dict) -> dict | None:
+        """用新的快照覆盖已存在的光标条目（AI 重抠后同步图库预览/再应用）。
+
+        保留 name/category/created/upload_ids/source_hashes 等来源信息，
+        只更新内容文件与可变的展示元数据；条目不存在时返回 None。
+        """
+        entry = self.index["cursors"].get(cid)
+        if not entry:
+            return None
+        folder = os.path.join(self.cursors_dir, cid)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "ani"), "wb") as f:
+            f.write(ani_bytes)
+        with open(os.path.join(folder, "preview.png"), "wb") as f:
+            f.write(preview_png)
+        for i, png in enumerate(frames_png):
+            with open(os.path.join(folder, f"frame_{i}.png"), "wb") as f:
+                f.write(png)
+        # 帧数减少时清理旧帧文件，避免图库恢复读到残留帧
+        for old in os.listdir(folder):
+            if old.startswith("frame_") and old.endswith(".png"):
+                idx = old[6:-4]
+                if not idx.isdigit() or int(idx) >= len(frames_png):
+                    try:
+                        os.remove(os.path.join(folder, old))
+                    except OSError:
+                        pass
+        with self._io_lock:
+            for key in ("size", "hotspot", "frames", "durations", "animated"):
+                if key in meta_updates:
+                    entry[key] = meta_updates[key]
+            self._save()
+        return entry
+
     def find_cursor_by_sources(self, source_hashes: list[str]) -> dict | None:
         """按来源内容哈希集合查找已存在的光标（查重）。"""
         target = sorted(source_hashes)
@@ -362,7 +495,10 @@ class CursorStore:
             p = os.path.join(folder, f"frame_{i}.png")
             if not os.path.exists(p):
                 break
-            frames.append(Image.open(p).convert("RGBA"))
+            # with 确保关闭文件句柄, 否则 Windows 上删除该光标目录时
+            # 会因句柄占用失败, 留下孤儿文件
+            with Image.open(p) as im:
+                frames.append(im.convert("RGBA"))
             i += 1
         return frames or None
 
@@ -428,9 +564,23 @@ class CursorApp:
 
     def __init__(self, store_root: str | None = None):
         self.mgr = CursorManager()
-        self.mgr.backup_original()
         self.lock = threading.Lock()
         self.store = CursorStore(root=store_root)
+        # 崩溃标记: 上次退出若未干净恢复光标(异常/强杀), 会留下该标记。
+        # 下次启动先广播 SPI_SETCURSORS 回到系统主题默认光标,
+        # 再备份——否则备份到的"原始光标"可能是上次残留的自定义光标,
+        # 导致"恢复默认"永远恢复不回去。
+        self.crash_marker = os.path.join(self.store.root, ".crash_marker")
+        if os.path.exists(self.crash_marker):
+            try:
+                self.mgr.reload_system_defaults()
+            except Exception:
+                pass
+            try:
+                os.remove(self.crash_marker)
+            except OSError:
+                pass
+        self.mgr.backup_original()
         self.canvas_size = DEFAULT_CANVAS_SIZE
         self.frames: list[Image.Image] = []
         self.durations: list[int] = []
@@ -444,6 +594,14 @@ class CursorApp:
         self.removal_diagnostics: dict | None = None
         self.src_size: tuple[int, int] | None = None
         self.last_cursor_id: str | None = None
+        # AI 智能抠图: 保留原分辨率处理帧，供 ONNX 重抠与后续 QA 复用
+        self.source_frames: list[Image.Image] = []
+        self.source_diags: list[RemovalDiagnostics] = []
+        self.ai_segmenter = LazyOnnxSegmenter()
+        self.ai_lock = threading.Lock()
+        self.ai_job: dict = {
+            "state": "idle", "progress": 0.0, "message": "", "error": None,
+        }
 
     # ── 上传 → 分析 ────────────────────────────────────
     def _process_files(self, file_items: list[tuple[str, bytes]]):
@@ -464,32 +622,32 @@ class CursorApp:
         file_info: list[dict] = []   # 每个文件: {name, data, frames 区间, 帧数}
 
         for _name, data in file_items:
-            src = Image.open(io.BytesIO(data))
+            try:
+                src = Image.open(io.BytesIO(data))
+            except Exception as e:
+                raise ValueError(f"无法解析图片文件: {e}") from e
             n_frames = getattr(src, "n_frames", 1)
             start = len(processed)
             file_durations: list[int] = []
             file_frames: list[Image.Image] = []
 
             if n_frames > 1:
-                # 动画图片（GIF 等）: 提取全部帧，用其自带帧时长
-                for i in range(n_frames):
-                    src.seek(i)
-                    img = src.convert("RGBA")
-                    dur = int(src.info.get("duration", FRAME_MS) or FRAME_MS)
-                    file_durations.append(max(20, min(2000, dur)))
-                    file_frames.append(img)
+                # 动画图片（GIF 等）: 提取全部帧（GIF 手动合成 disposal 帧），
+                # 用其自带帧时长
+                file_frames, file_durations = _extract_animation_frames(src)
             else:
                 file_durations.append(FRAME_MS)
                 file_frames.append(src.convert("RGBA"))
 
             # 背景一致性: 任一帧无真实 alpha → 该文件全部帧统一抠背景，
             # 避免 GIF 动画播放时（如帧0透明、帧1白底）闪现背景色块。
-            # 背景色取第一帧的边框主色作为整组帧的统一基准，
+            # 背景色取"边框不透明"的帧的边框主色作为整组帧的统一基准
+            # （跳过透明首帧——透明像素的 RGB 是调色板垃圾值），
             # 防止个别帧边框被图案占满导致颜色估计失败。
             need_bg = any(f.getchannel("A").getextrema()[0] >= 250 for f in file_frames)
             if need_bg:
                 from pointer_analyzer import estimate_background_color
-                bg_hint = estimate_background_color(file_frames[0])
+                bg_hint = estimate_background_color(_pick_bg_hint_frame(file_frames))
                 for img in file_frames:
                     out, ok, diag = auto_remove_background(
                         img,
@@ -578,6 +736,176 @@ class CursorApp:
             "removal_diagnostics": representative.as_dict() if representative else None,
         }
 
+    # ── AI 智能抠图（可选 ONNX，懒下载/懒加载）────────────
+    def ai_status(self) -> dict:
+        seg = self.ai_segmenter
+        with self.ai_lock:
+            job = dict(self.ai_job)
+        return {**seg.status(), "job": job}
+
+    def start_ai_cutout(self) -> dict:
+        """启动后台 AI 抠图任务（下载模型 + 推理 + QA + 更新工作帧）。"""
+        with self.lock:
+            if not self.source_frames:
+                return {
+                    "started": False,
+                    "error": "当前没有可处理的图片，请先上传。",
+                    "job": dict(self.ai_job),
+                }
+        with self.ai_lock:
+            if self.ai_job.get("state") in ("downloading", "inferring"):
+                return {"started": False, "job": dict(self.ai_job)}
+            self.ai_job = {
+                "state": "starting", "progress": 0.0,
+                "message": "准备中…", "error": None,
+            }
+        threading.Thread(target=self._ai_cutout_worker, daemon=True).start()
+        return {"started": True, "job": dict(self.ai_job)}
+
+    def _ai_cutout_worker(self) -> None:
+        try:
+            with self.lock:
+                if not self.source_frames:
+                    raise ValueError("当前没有可处理的图片，请先上传。")
+                src_frames = list(self.source_frames)
+                src_diags = list(self.source_diags)
+                durations = list(self.durations)
+                canvas_size = self.canvas_size
+                last_cursor_id = self.last_cursor_id
+
+            def _progress(fraction: float, message: str) -> None:
+                with self.ai_lock:
+                    self.ai_job.update(
+                        state="downloading", progress=fraction,
+                        message=message, error=None)
+
+            self.ai_segmenter.require_runtime()
+            self.ai_segmenter.download(progress_cb=_progress)
+
+            with self.ai_lock:
+                self.ai_job.update(
+                    state="inferring", progress=0.0,
+                    message="AI 抠图中…", error=None)
+
+            outputs: list[tuple[Image.Image, bool]] = []
+            for i, img in enumerate(src_frames):
+                with self.ai_lock:
+                    self.ai_job.update(
+                        state="inferring",
+                        progress=i / max(1, len(src_frames)),
+                        message=f"AI 抠图 {i + 1}/{len(src_frames)}")
+                mask = self.ai_segmenter.segment(img)
+                if mask is None:
+                    outputs.append((img, False))
+                else:
+                    outputs.append((composite_alpha(img, mask), True))
+
+            # AI 掩码走与启发式同一套光标尺度 QA
+            diags: list[RemovalDiagnostics] = []
+            for i, (img, ok) in enumerate(outputs):
+                if ok:
+                    diags.append(diagnose_alpha_mask(
+                        img.getchannel("A"), canvas_size))
+                elif i < len(src_diags):
+                    diags.append(src_diags[i])
+                else:
+                    diags.append(RemovalDiagnostics(
+                        success=False, method="onnx", selected_stage="none",
+                        confidence="low", auto_apply=False,
+                        issues=[Issue("error", "AI_FAILED",
+                                      "AI 抠图未产生可用掩码。")]))
+
+            # 复用上传路径的联合裁剪 + 画布适配
+            source_frames = [img for img, _ok in outputs]
+            crop_box = _subject_crop_box(source_frames)
+            frames = [self._fit_to_canvas(img, canvas_size, crop_box)
+                      for img in source_frames]
+            verdicts = [analyze(img, removal_ok=True) for img, _ok in outputs]
+            worst = min(verdicts, key=lambda a: a.score)
+            quality = self._quality_summary(worst, diags)
+            hotspot = analyze(frames[0], target_size=canvas_size).hotspot
+
+            with self.lock:
+                self.frames = frames
+                self.durations = durations[: len(frames)]
+                self.hotspot = hotspot
+                self.verdict = quality["verdict"]
+                self.score = quality["score"]
+                self.issues = quality["issues"]
+                self.removal_confidence = quality["removal_confidence"]
+                self.auto_apply_allowed = quality["auto_apply"]
+                self.removal_diagnostics = quality["removal_diagnostics"]
+                self.src_size = (source_frames[0].width,
+                                 source_frames[0].height)
+                self.source_frames = source_frames
+                self.source_diags = diags
+                canvas_size_snap = canvas_size
+                hotspot_snap = hotspot
+
+            # 同步图库快照: AI 重抠结果也要反映到图库预览与"重新应用"
+            if last_cursor_id:
+                entry = self.store.get_cursor(last_cursor_id)
+                if entry:
+                    title = entry.get("name") or "光标"
+                    ani_bytes = build_ani_file(
+                        frames=frames,
+                        hotspots=[hotspot] * len(frames),
+                        frame_durations_ms=durations[: len(frames)],
+                        title=title,
+                        author="Custom Cursor Web",
+                    )
+                    preview_buf = io.BytesIO()
+                    big = frames[0].resize(
+                        (frames[0].width * 4, frames[0].height * 4),
+                        Image.NEAREST)
+                    big.save(preview_buf, format="PNG")
+                    frames_png = []
+                    for f in frames:
+                        b = io.BytesIO()
+                        f.save(b, format="PNG")
+                        frames_png.append(b.getvalue())
+                    self.store.refresh_cursor(
+                        last_cursor_id, ani_bytes, preview_buf.getvalue(),
+                        frames_png,
+                        {"size": canvas_size, "hotspot": list(hotspot),
+                         "frames": len(frames),
+                         "durations": durations[: len(frames)],
+                         "animated": len(frames) > 1},
+                    )
+
+            result = {
+                "frames": len(frames),
+                "canvas_size": canvas_size_snap,
+                "hotspot": list(hotspot_snap),
+                "verdict": quality["verdict"],
+                "score": quality["score"],
+                "issues": quality["issues"],
+                "removal_confidence": quality["removal_confidence"],
+                "auto_apply": quality["auto_apply"],
+                "removal_diagnostics": quality["removal_diagnostics"],
+                "src_size": list(self.src_size),
+                "crop_box": list(crop_box) if crop_box else None,
+                "previews": self._frames_to_previews(frames),
+                "method": "onnx",
+            }
+            with self.ai_lock:
+                self.ai_job = {
+                    "state": "done", "progress": 1.0,
+                    "message": "AI 抠图完成", "error": None, "result": result,
+                }
+        except (OnnxNotInstalledError, ModelDownloadError, ValueError) as e:
+            with self.ai_lock:
+                self.ai_job = {
+                    "state": "error", "progress": 0.0,
+                    "message": "AI 抠图失败", "error": str(e),
+                }
+        except Exception as e:
+            with self.ai_lock:
+                self.ai_job = {
+                    "state": "error", "progress": 0.0,
+                    "message": "AI 抠图失败", "error": str(e),
+                }
+
     @staticmethod
     def _ani_durations_ms(ani_bytes: bytes) -> list[int]:
         """从 .ani 文件的 rate 块解析逐帧时长（旧图库条目无 durations 时的兜底）。"""
@@ -630,6 +958,10 @@ class CursorApp:
             self.auto_apply_allowed = quality["auto_apply"]
             self.removal_diagnostics = quality["removal_diagnostics"]
             self.src_size = (processed[0][0].width, processed[0][0].height)
+            self.source_frames = source_frames
+            self.source_diags = removal_diags
+            hotspot = self.hotspot  # 锁内快照, 供锁外构建 .ani/预览使用
+            canvas_size = self.canvas_size
 
         # ── 存储: 上传原图 + 生成的光标快照 ──
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -664,7 +996,7 @@ class CursorApp:
             datetime.datetime.now().strftime("光标 %m-%d %H:%M"))
         ani_bytes = build_ani_file(
             frames=frames,
-            hotspots=[self.hotspot] * len(frames),
+            hotspots=[hotspot] * len(frames),
             frame_durations_ms=durations[: len(frames)],
             title=cursor_name,
             author="Custom Cursor Web",
@@ -680,8 +1012,8 @@ class CursorApp:
         dup_cursor = self.store.find_cursor_by_sources(file_shas)
         c_entry = self.store.add_cursor(
             ani_bytes, preview_buf.getvalue(), frames_png,
-            {"name": cursor_name, "created": now, "size": self.canvas_size,
-             "hotspot": list(self.hotspot), "frames": len(frames),
+            {"name": cursor_name, "created": now, "size": canvas_size,
+             "hotspot": list(hotspot), "frames": len(frames),
              "durations": durations[: len(frames)],
              "animated": len(frames) > 1, "upload_ids": upload_ids,
              "source_hashes": file_shas},
@@ -689,8 +1021,8 @@ class CursorApp:
         with self.lock:
             self.last_cursor_id = c_entry["id"]
 
-        # 预览: 每帧 4x 放大 PNG → base64
-        previews = self.previews()
+        # 预览: 用局部帧快照生成（避免与 set_size/rotate 并发时读 self.frames）
+        previews = self._frames_to_previews(frames)
 
         hard_reject = any(
             it.level == "error" and it.code in HARD_REJECT_CODES for it in worst.issues
@@ -698,8 +1030,8 @@ class CursorApp:
 
         return {
             "frames": len(frames),
-            "canvas_size": self.canvas_size,
-            "hotspot": list(self.hotspot),
+            "canvas_size": canvas_size,
+            "hotspot": list(hotspot),
             "verdict": quality["verdict"],
             "score": quality["score"],
             "issues": self.issues,
@@ -774,19 +1106,22 @@ class CursorApp:
                 self.auto_apply_allowed = True
                 self.removal_diagnostics = None
                 self.last_cursor_id = existing["id"]
+                canvas_size = self.canvas_size
+                hotspot = self.hotspot
+                src_size = self.src_size
             return {
                 "existing": True,
                 "frames": len(frames),
-                "canvas_size": self.canvas_size,
-                "hotspot": list(self.hotspot),
+                "canvas_size": canvas_size,
+                "hotspot": list(hotspot),
                 "verdict": "适合",
                 "score": 100,
                 "issues": [],
                 "removal_confidence": "high",
                 "auto_apply": True,
                 "removal_diagnostics": None,
-                "src_size": list(self.src_size),
-                "previews": self.previews(),
+                "src_size": list(src_size),
+                "previews": self._frames_to_previews(frames),
                 "hard_reject": False,
                 "cursor_id": existing["id"],
                 "cursor_name": existing["name"],
@@ -815,6 +1150,10 @@ class CursorApp:
             self.auto_apply_allowed = quality["auto_apply"]
             self.removal_diagnostics = quality["removal_diagnostics"]
             self.src_size = (processed[0][0].width, processed[0][0].height)
+            self.source_frames = source_frames
+            self.source_diags = removal_diags
+            hotspot = self.hotspot  # 锁内快照, 供锁外构建 .ani/预览使用
+            canvas_size = self.canvas_size
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor_name = _sanitize_name(
@@ -822,7 +1161,7 @@ class CursorApp:
             datetime.datetime.now().strftime("光标 %m-%d %H:%M"))
         ani_bytes = build_ani_file(
             frames=frames,
-            hotspots=[self.hotspot] * len(frames),
+            hotspots=[hotspot] * len(frames),
             frame_durations_ms=durations[: len(frames)],
             title=cursor_name,
             author="Custom Cursor Web",
@@ -837,8 +1176,8 @@ class CursorApp:
             frames_png.append(b.getvalue())
         c_entry = self.store.add_cursor(
             ani_bytes, preview_buf.getvalue(), frames_png,
-            {"name": cursor_name, "created": now, "size": self.canvas_size,
-             "hotspot": list(self.hotspot), "frames": len(frames),
+            {"name": cursor_name, "created": now, "size": canvas_size,
+             "hotspot": list(hotspot), "frames": len(frames),
              "durations": durations[: len(frames)],
              "animated": len(frames) > 1, "upload_ids": [uid],
              "source_hashes": [sha]},
@@ -852,8 +1191,8 @@ class CursorApp:
         return {
             "existing": False,
             "frames": len(frames),
-            "canvas_size": self.canvas_size,
-            "hotspot": list(self.hotspot),
+            "canvas_size": canvas_size,
+            "hotspot": list(hotspot),
             "verdict": quality["verdict"],
             "score": quality["score"],
             "issues": self.issues,
@@ -862,7 +1201,7 @@ class CursorApp:
             "removal_diagnostics": quality["removal_diagnostics"],
             "src_size": list(self.src_size),
             "crop_box": list(crop_box) if crop_box else None,
-            "previews": self.previews(),
+            "previews": self._frames_to_previews(frames),
             "hard_reject": hard_reject,
             "cursor_id": c_entry["id"],
             "cursor_name": c_entry["name"],
@@ -874,15 +1213,20 @@ class CursorApp:
         with self.lock:
             return self._previews_unlocked()
 
-    def _previews_unlocked(self) -> list[str]:
+    @staticmethod
+    def _frames_to_previews(frames: list[Image.Image]) -> list[str]:
+        """把给定帧列表转 base64 预览（对局部帧快照安全, 无锁内调用限制）。"""
         out = []
-        for f in self.frames:
+        for f in frames:
             big = f.resize((f.width * 4, f.height * 4), Image.NEAREST)
             buf = io.BytesIO()
             big.save(buf, format="PNG")
             out.append("data:image/png;base64,"
                        + base64.b64encode(buf.getvalue()).decode())
         return out
+
+    def _previews_unlocked(self) -> list[str]:
+        return self._frames_to_previews(self.frames)
 
     def set_size(self, size: int) -> dict:
         """调整光标画布尺寸；已有帧和热点等比缩放；启用中立即重新生效。"""
@@ -983,8 +1327,11 @@ class CursorApp:
 
     def restore(self) -> bool:
         with self.lock:
-            self.mgr.restore_original()
+            # 先置 enabled=False 再恢复: 若 restore_original 中途失败
+            # (如 SPI_SETCURSORS 广播失败), 状态仍与实际一致(光标已恢复/恢复中),
+            # 不会出现"界面显示已启用但光标已还原"的假象。
             self.enabled = False
+            self.mgr.restore_original()
             return False
 
     def set_hotspot(self, x: int, y: int) -> bool:
@@ -1139,15 +1486,30 @@ class CursorApp:
         self.last_cursor_id = None
 
     def cleanup(self) -> None:
-        """退出时恢复光标并释放资源。"""
-        try:
-            if self.enabled:
-                self.mgr.restore_original()
-        except Exception:
+        """退出时恢复光标并释放资源。
+
+        恢复失败时留下崩溃标记, 下次启动会强制回到系统默认光标
+        (见 __init__ 的标记检测); 恢复成功则清除历史标记。
+        """
+        restored = not self.enabled  # 未启用 = 光标未被改过, 视为已恢复
+        if self.enabled:
             try:
-                self.mgr.reload_system_defaults()
+                self.mgr.restore_original()
+                restored = True
             except Exception:
-                pass
+                try:
+                    self.mgr.reload_system_defaults()
+                except Exception:
+                    pass
+        try:
+            if restored:
+                if os.path.exists(self.crash_marker):
+                    os.remove(self.crash_marker)
+            else:
+                with open(self.crash_marker, "w") as f:
+                    f.write("previous exit did not restore the system cursor\n")
+        except OSError:
+            pass
         self.mgr.cleanup()
 
 
@@ -1194,6 +1556,9 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                 return
             if path == "/api/previews":
                 self._send_json({"previews": app.previews()})
+                return
+            if path == "/api/ai/status":
+                self._send_json(app.ai_status())
                 return
             if path == "/api/gallery":
                 self._send_json(app.gallery())
@@ -1252,6 +1617,8 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     length = int(self.headers.get("Content-Length", 0))
                     data = json.loads(self.rfile.read(length) or b"{}")
                     self._send_json(app.set_size(int(data.get("size", DEFAULT_CANVAS_SIZE))))
+                elif path == "/api/ai/cutout":
+                    self._send_json(app.start_ai_cutout())
                 elif path.startswith("/api/gallery/"):
                     self._handle_gallery_action(path)
                 elif path == "/api/quit":
@@ -1314,6 +1681,15 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                 return
             boundary = pdict["boundary"].encode()
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length <= 0:
+                self._send_error(400, "请求体为空")
+                return
+            if content_length > MAX_UPLOAD_BYTES:
+                self._send_error(
+                    413,
+                    f"文件过大: 超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 上限",
+                )
+                return
             raw = self.rfile.read(content_length)
             files: list[tuple[str, bytes]] = []
             for part in raw.split(b"--" + boundary):

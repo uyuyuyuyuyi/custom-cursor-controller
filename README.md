@@ -18,6 +18,7 @@ Programmatically built `.ani` files (pure Python), image analysis & background r
 |---|---|
 | 🖱️ **上传任意图片生成光标**：拖拽/点击上传，自动判断**适不适合做光标**（空白/低对比/过多细节/无法抠背景等被拦截或警告，可强制使用） | **Upload any image** to generate a cursor; automatic suitability check (blank / low contrast / too complex / background can't be removed → blocked or warned, force-use allowed) |
 | 🎞️ **GIF 动画支持**：多帧提取、保留原始帧时长、动画预览轮播 | **Animated GIF support**: multi-frame extraction, original frame durations kept, live preview loop |
+| ✨ **可选 AI 智能抠图**：一键 ONNX 抠图（模型首次使用才下载、不入安装包；Apache-2.0 可商用） | **Optional ONNX AI cutout**: one-click background removal (model lazy-downloaded on first use, never bundled; Apache-2.0, commercial-friendly) |
 | 🔄 **自动替换**：上传新图片自动生成新光标并替换系统光标 + 弹窗提示 | **Auto-swap**: a new upload auto-generates and replaces the cursor, with a popup notice |
 | 🎯 点击预览设置**热点**；↺/↻ **旋转 90°**；**光标大小** 48/64/96 可选 | Click-to-set **hotspot**; ↺/↻ **rotate 90°**; **cursor size** 48/64/96 selectable |
 | 🗂 **图库**：所有上传图片与生成光标存于 `C:\Program Files\custom-cursor-controller\data\`，可查看 / 应用 / 重命名 / 归类 / 删除 | **Gallery**: all uploads & cursors stored in `C:\Program Files\custom-cursor-controller\data\`, view / apply / rename / categorize / delete |
@@ -59,6 +60,18 @@ pip install -r requirements.txt
 # 3. Run the GUI (pywebview window hosting the Vue frontend)
 python custom_cursor_gui.pyw
 ```
+
+### Optional AI cutout / 可选 AI 智能抠图
+
+```bash
+pip install -r requirements-ai.txt
+```
+
+安装后，控制台的「适合度分析」卡片会出现 **✨ AI 智能抠图** 按钮：
+模型在首次点击时才下载到用户数据目录（约 44MB 量化版，SHA-256 校验），
+推理结果仍走同一套光标尺度质量门控——低可信结果只预览、需手动确认；
+模型选型为 ormbg（Apache-2.0，可商用），不使用 BRIA RMBG（CC BY-NC 4.0，仅限非商业）。
+未安装 AI 依赖时程序行为与之前完全一致，安装包体积不受影响。
 
 > 前端已构建好的版本在 `webui/dist`；如需重新构建：`cd webui && npm install && npm run build`。
 
@@ -131,15 +144,21 @@ custom-cursor-controller/
 │                          # Vue 3 前端源码（构建产物 webui/dist 由后端托管）
 ├── pointer_analyzer.py    # Suitability scoring + auto background removal (with multi-frame
 │                          # consistency for GIFs) 图片适合度分析 + 自动抠背景（含 GIF 帧一致性）
+├── onnx_cutout.py         # Optional ONNX AI cutout: lazy download + lazy load (Apache-2.0 model)
+│                          # 可选 ONNX 智能抠图：懒下载 + 懒加载（Apache-2.0 模型，可商用）
 ├── ani_builder.py         # Pure-Python RIFF/ACON (.ani) binary builder
 │                          # 纯 Python 的 RIFF/ACON (.ani) 二进制构建器
-├── test_web_api.py        # End-to-end API tests (95 checks, incl. real cursor swap)
-│                          # API 端到端测试（95 项，含真实光标替换）
+├── test_web_api.py        # End-to-end API tests (102 checks, incl. real cursor swap)
+│                          # API 端到端测试（102 项，含真实光标替换）
 ├── test_image_quality.py  # Real-image mask/alpha quality regressions (no cursor swap)
 │                          # 真实图片抠图/Alpha 质量回归（不会替换系统光标）
+├── test_onnx_cutout.py    # ONNX cutout unit tests (fake session; no network/cursor swap)
+│                          # ONNX 抠图单元测试（假会话；无网络、不碰系统光标）
 ├── CustomCursorController.spec  # PyInstaller spec (embeds webui/dist)
 │                          # 打包配置（内嵌前端）
 ├── requirements.txt       # pystray + Pillow + pywebview + pythonnet
+├── requirements-ai.txt    # Optional AI deps: onnxruntime + numpy
+│                          # 可选 AI 依赖：onnxruntime + numpy
 ├── data/                  # User data (created at runtime): uploads/ + cursors/ + index.json
 │                          # 用户数据（运行时创建，默认位于 C:\Program Files\custom-cursor-controller\data\）
 └── dist/                  # Build output: CustomCursorController.exe
@@ -181,10 +200,12 @@ custom-cursor-controller/
 
 ## 🧪 Tests / 自测脚本
 
-- `python test_web_api.py` — end-to-end API tests: upload/analyze/apply/restore, rotate & size, gallery CRUD, content dedup, GIF multi-frame + white-background consistency (95 checks, briefly swaps the real cursor).
-  端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性（95 项，会短暂替换真实光标）。
+- `python test_web_api.py` — end-to-end API tests: upload/analyze/apply/restore, rotate & size, gallery CRUD, content dedup, GIF multi-frame + white-background consistency, AI status/cutout gating (102 checks, briefly swaps the real cursor).
+  端到端 API 测试：上传/分析/应用/恢复、旋转与尺寸、图库 CRUD、内容查重、GIF 多帧与白底一致性、AI 状态与任务门控（102 项，会短暂替换真实光标）。
 - `python -m unittest -v test_image_quality.py` — real `test_res` confidence routing, destructive-postfill rollback, and premultiplied-alpha regressions; does not touch the system cursor.
   真实 `test_res` 可信度路由、破坏性补抠回退与预乘 Alpha 回归测试；不会替换系统光标。
+- `python -m unittest -v test_onnx_cutout.py` — ONNX model metadata, fake-session inference, alpha compositing and graceful-degradation tests; no network, no cursor swap.
+  ONNX 模型元数据、假会话推理、alpha 合成与优雅降级测试；无网络、不替换系统光标。
 - `python -m ani_builder` — writes a 2-frame test cursor `test_cursor.ani`.
   生成两帧测试光标 `test_cursor.ani`。
 

@@ -158,6 +158,16 @@ def main():
     check("初始 enabled=False", st["enabled"] is False, f"frames={st['frames']}")
     check("默认画布 64", st.get("canvas_size") == 64, f"canvas={st.get('canvas_size')}")
 
+    # 1b. AI 可选能力（不要求 onnxruntime 已安装，也不触发真实下载）
+    _, ai_st = req("GET", url + "/api/ai/status")
+    check("AI 状态接口可用", "onnx_installed" in ai_st and "model" in ai_st
+          and "job" in ai_st, f"keys={sorted(ai_st.keys())}")
+    check("AI 模型商用许可", ai_st.get("model", {}).get("license") == "apache-2.0",
+          f"license={ai_st.get('model', {}).get('license')}")
+    _, ai_rej = req("POST", url + "/api/ai/cutout")
+    check("无图片时 AI 抠图同步拒绝", ai_rej.get("started") is False
+          and "error" in ai_rej, f"resp={ai_rej}")
+
     # 2. 上传两张箭头（动画）
     _, up = upload(url, [make_arrow(), make_arrow((255, 200, 60, 255))])
     check("上传成功 frames=2", up["frames"] == 2, f"verdict={up['verdict']} score={up['score']}")
@@ -170,6 +180,32 @@ def main():
           f"name={up.get('cursor_name')}")
     check("上传返回 upload_ids", len(up.get("upload_ids", [])) == 2)
     check("data_dir 存在", os.path.isdir(up.get("data_dir", "nonexistent")))
+
+    # 1c. 光标快照刷新（AI 重抠后图库同步的存储层路径）
+    import io as _io
+    tmp_png_buf = _io.BytesIO()
+    Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(tmp_png_buf, format="PNG")
+    tmp_png = tmp_png_buf.getvalue()
+    tmp_entry = app.store.add_cursor(
+        b"RIFF-test-ani", tmp_png, [tmp_png, tmp_png],
+        {"name": "刷新测试", "size": 64, "hotspot": [1, 1], "frames": 2})
+    refreshed = app.store.refresh_cursor(
+        tmp_entry["id"], b"RIFF-refreshed-ani", tmp_png, [tmp_png],
+        {"size": 96, "hotspot": [3, 4], "frames": 1, "durations": [100],
+         "animated": False})
+    check("AI 快照刷新返回条目",
+          refreshed is not None and refreshed["id"] == tmp_entry["id"])
+    check("AI 快照刷新保留名称并更新元数据",
+          refreshed["name"] == "刷新测试" and refreshed["size"] == 96
+          and refreshed["hotspot"] == [3, 4] and refreshed["frames"] == 1
+          and refreshed["animated"] is False,
+          f"size={refreshed['size']} frames={refreshed['frames']}")
+    tmp_folder = os.path.join(app.store.cursors_dir, tmp_entry["id"])
+    check("AI 快照刷新清理旧帧文件",
+          os.path.exists(os.path.join(tmp_folder, "ani"))
+          and not os.path.exists(os.path.join(tmp_folder, "frame_1.png")),
+          f"files={sorted(os.listdir(tmp_folder))}")
+    app.store.delete("cursors", tmp_entry["id"])
 
     # 2b. /api/previews 可恢复读取（紧跟上传，工作帧未变）
     _, pv = req("GET", url + "/api/previews")

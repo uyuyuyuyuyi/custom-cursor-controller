@@ -24,6 +24,13 @@ const gallery = reactive({ uploads: [], cursors: [] })
 const uploading = ref(false)
 const busy = ref(false)
 const error = ref('')
+const ai = reactive({
+  onnxInstalled: false,
+  model: null,
+  job: { state: 'idle', progress: 0, message: '', error: null },
+})
+const aiBusy = computed(() =>
+  ai.job.state === 'starting' || ai.job.state === 'downloading' || ai.job.state === 'inferring')
 const dragging = ref(false)
 const confirm = reactive({
   show: false, title: '', body: [],
@@ -107,6 +114,93 @@ async function refreshState() {
   }
 }
 
+// ── AI 智能抠图（可选 ONNX，懒下载 + 懒加载）────────────
+async function refreshAiStatus() {
+  try {
+    const s = await api('/api/ai/status')
+    ai.onnxInstalled = s.onnx_installed
+    ai.model = s.model || null
+    ai.job = s.job || ai.job
+  } catch { /* 后端不支持时保持默认状态 */ }
+}
+
+async function startAiCutout() {
+  if (!state.frames) { error.value = '请先上传图片再使用 AI 抠图。'; return }
+  if (aiBusy.value) return
+  error.value = ''
+  busy.value = true
+  try {
+    const r = await api('/api/ai/cutout', { method: 'POST' })
+    if (!r.started) { error.value = r.error || 'AI 抠图任务已在运行。'; return }
+    await pollAiJob()
+  } catch (e) {
+    error.value = `启动 AI 抠图失败: ${e.message}`
+  } finally {
+    busy.value = false
+  }
+}
+
+async function pollAiJob() {
+  for (;;) {
+    await new Promise(res => setTimeout(res, 800))
+    const s = await api('/api/ai/status')
+    ai.onnxInstalled = s.onnx_installed
+    ai.model = s.model || ai.model
+    ai.job = s.job || ai.job
+    if (ai.job.state === 'done') {
+      await applyAiResult(ai.job.result)
+      return
+    }
+    if (ai.job.state === 'error') {
+      error.value = `AI 抠图失败: ${ai.job.error || '未知错误'}`
+      showToast('AI 抠图失败', 'warn')
+      return
+    }
+  }
+}
+
+async function applyAiResult(r) {
+  state.previews = r.previews
+  state.hotspot = r.hotspot
+  state.frames = r.frames
+  state.canvasSize = r.canvas_size
+  state.srcSize = r.src_size
+  state.verdict = r.verdict
+  state.score = r.score
+  state.issues = r.issues
+  state.removalConfidence = r.removal_confidence || null
+  state.autoApply = r.auto_apply === true
+  animIndex.value = 0
+  startAnim()
+  await refreshGallery()   // 图库快照已由后端同步，刷新预览
+  if (r.auto_apply === true) {
+    try {
+      await apply()
+      showToast('AI 抠图完成并已应用')
+    } catch (e) {
+      error.value = `AI 抠图完成，但应用失败: ${e.message}`
+    }
+  } else {
+    confirm.title = r.removal_confidence === 'low' ? 'AI 抠图可信度较低' : '请确认 AI 抠图结果'
+    confirm.body = r.issues && r.issues.length
+      ? r.issues.map(i => `• ${i.message}`)
+      : ['• 系统未能确认主体是否完整，因此没有自动应用。']
+    confirm.action = async () => {
+      try {
+        await apply()
+        showToast('已应用 AI 抠图结果')
+      } catch (e) {
+        error.value = `应用失败: ${e.message}`
+      }
+    }
+    confirm.action2 = null
+    confirm.action2Label = ''
+    confirm.actionLabel = '仍然应用'
+    confirm.cancelAction = null
+    confirm.show = true
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('error', (e) => {
     error.value = `前端错误: ${e.message}`
@@ -114,6 +208,7 @@ onMounted(async () => {
   try {
     await refreshState()
     await refreshGallery()
+    await refreshAiStatus()
   } catch (e) {
     error.value = `无法连接后端服务: ${e.message}`
   }
@@ -156,6 +251,26 @@ async function doUpload(fileList) {
       showToast(`已替换为新光标「${r.cursor_name}」`)
     }
 
+    // 取消上传: 删除本次刚保存的光标快照与图片(级联删除独占图片 + 逐个兜底)
+    const cleanupUploaded = async () => {
+      try {
+        await api(`/api/gallery/cursors/${r.cursor_id}/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ with_uploads: true }),
+        })
+      } catch { /* ignore */ }
+      for (const uid of (r.upload_ids || [])) {
+        try { await api(`/api/gallery/uploads/${uid}/delete`, { method: 'POST' }) } catch { /* ignore */ }
+      }
+    }
+    const cancelAndNotify = async () => {
+      await cleanupUploaded()
+      await refreshGallery()
+      await refreshState()   // 同步清空工作状态(后端删除光标时已重置)
+      showToast('已取消，未保存本次上传')
+    }
+
     const verdictFlow = () => {
       confirm.action2 = null
       confirm.action2Label = ''
@@ -164,7 +279,7 @@ async function doUpload(fileList) {
         confirm.title = '图片不适合做光标'
         confirm.body = r.issues.map(i => `• ${i.message}`)
         confirm.action = r.hard_reject ? null : applyAndNotify
-        confirm.cancelAction = null
+        confirm.cancelAction = cancelAndNotify
         confirm.show = true
       } else if (r.verdict === '有风险' || r.auto_apply !== true) {
         confirm.title = r.removal_confidence === 'low'
@@ -174,7 +289,7 @@ async function doUpload(fileList) {
           ? r.issues.map(i => `• ${i.message}`)
           : ['• 系统未能确认主体是否完整，因此没有自动应用。']
         confirm.action = applyAndNotify
-        confirm.cancelAction = null
+        confirm.cancelAction = cancelAndNotify
         confirm.show = true
       } else {
         applyAndNotify()
@@ -193,11 +308,9 @@ async function doUpload(fileList) {
       confirm.action = verdictFlow
       confirm.cancelAction = async () => {
         // 取消: 删除本次刚保存的条目
-        try { await api(`/api/gallery/cursors/${r.cursor_id}/delete`, { method: 'POST' }) } catch { /* ignore */ }
-        for (const uid of (r.upload_ids || [])) {
-          try { await api(`/api/gallery/uploads/${uid}/delete`, { method: 'POST' }) } catch { /* ignore */ }
-        }
+        await cleanupUploaded()
         await refreshGallery()
+        await refreshState()
         showToast('已取消，未保存重复内容')
       }
       confirm.show = true
@@ -537,7 +650,19 @@ async function generateFromUpload(u) {
       confirm.action2 = null
       confirm.action2Label = ''
       confirm.actionLabel = '仍然应用'
-      confirm.cancelAction = null
+      confirm.cancelAction = async () => {
+        // 取消: 删除本次新生成的光标(图库图片本身保留)
+        if (!r.existing) {
+          try {
+            await api(`/api/gallery/cursors/${r.cursor_id}/delete`, { method: 'POST' })
+          } catch { /* ignore */ }
+          await refreshGallery()
+          await refreshState()
+          showToast('已取消，未保存新生成的光标')
+        } else {
+          showToast('已取消')
+        }
+      }
       confirm.show = true
     } else {
       await applyAndNotify()
@@ -552,6 +677,16 @@ async function generateFromUpload(u) {
 // ── 关闭窗口 → 请求退出 ───────────────────────────────
 function quitApp() {
   api('/api/quit', { method: 'POST' }).catch(() => {})
+}
+
+// 关闭确认框: 与"取消"按钮同一路径, 必须执行挂起的取消清理
+// (如查重的"取消"会删除刚保存的重复条目)——直接置 show=false
+// 会绕过清理, 导致重复内容静默残留。
+function closeConfirm() {
+  const pending = confirm.cancelAction
+  confirm.show = false
+  confirm.cancelAction = null
+  if (pending) pending()
 }
 </script>
 
@@ -637,6 +772,17 @@ function quitApp() {
             </li>
             <li v-if="!state.issues.length" class="ok">✓ 未发现问题，图片可以直接使用</li>
           </ul>
+          <div class="ai-row">
+            <button class="btn small primary" :disabled="busy || uploading || !state.frames || aiBusy"
+                    @click="startAiCutout">✨ AI 智能抠图</button>
+            <span v-if="aiBusy" class="ai-status">{{ ai.job.message || '处理中…' }}</span>
+            <span v-else-if="ai.model && !ai.model.downloaded" class="ai-status">
+              {{ ai.model.license === 'apache-2.0' ? 'Apache-2.0 可商用' : ai.model.license }}
+              · {{ ai.model.size_mb }}MB（首次使用自动下载，不入安装包）
+            </span>
+            <span v-else-if="ai.model && ai.model.downloaded" class="ai-status ok">AI 模型已就绪</span>
+            <span v-else-if="!ai.onnxInstalled" class="ai-status warn">未安装 AI 依赖（onnxruntime）</span>
+          </div>
         </div>
       </section>
     </main>
@@ -715,14 +861,14 @@ function quitApp() {
     </transition>
 
     <!-- 确认对话框 -->
-    <div v-if="confirm.show" class="modal-mask" @click.self="confirm.show = false">
+    <div v-if="confirm.show" class="modal-mask" @click.self="closeConfirm()">
       <div class="modal">
         <h3>{{ confirm.title }}</h3>
         <ul class="issue-list">
           <li v-for="(t, i) in confirm.body" :key="i"><span class="lvl">提示</span>{{ t }}</li>
         </ul>
         <div class="modal-actions">
-          <button class="btn" @click="confirm.cancelAction ? (confirm.cancelAction(), confirm.show = false) : (confirm.show = false)">取消</button>
+          <button class="btn" @click="closeConfirm()">取消</button>
           <button v-if="confirm.action2" class="btn" @click="confirm.action2(); confirm.show = false">{{ confirm.action2Label || '仅删除本条' }}</button>
           <button v-if="confirm.action" class="btn primary" @click="confirm.action(); confirm.show = false">{{ confirm.actionLabel || '确定' }}</button>
         </div>

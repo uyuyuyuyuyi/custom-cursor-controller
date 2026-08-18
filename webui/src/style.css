@@ -185,6 +185,10 @@ body {
 }
 .issue-list li.error { border-color: rgba(255, 92, 92, .35); color: #ffb3b3; }
 .issue-list li.ok { border-color: rgba(52, 201, 143, .3); color: #a9e8cf; }
+.ai-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.ai-status { font-size: 12px; color: var(--text-dim); }
+.ai-status.ok { color: #2ecc71; }
+.ai-status.warn { color: var(--amber); }
 .lvl {
   display: inline-block; font-size: 10.5px; font-weight: 700;
   margin-right: 8px; padding: 1px 7px; border-radius: 6px; vertical-align: 1px;

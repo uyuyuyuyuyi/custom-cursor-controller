@@ -317,6 +317,32 @@ def _diagnose_mask(
     return ("low" if low else "medium" if medium else "high"), issues
 
 
+def diagnose_alpha_mask(
+    mask: Image.Image,
+    quality_size: int = TARGET_SIZE,
+    method: str = "onnx",
+    selected_stage: str = "onnx",
+) -> RemovalDiagnostics:
+    """为独立生成的掩码（如 ONNX 智能抠图）做光标尺度质量诊断。
+
+    AI 掩码与启发式候选走同一套 QA: 先映射到最终光标尺寸,
+    再检查碎片/孔洞/边缘泄漏/前景占比, 低置信度禁止静默自动应用。
+    """
+    quality_alpha = _fit_alpha_for_quality(mask.convert("L"), quality_size)
+    stats = _mask_quality(quality_alpha)
+    confidence, issues = _diagnose_mask(stats)
+    return RemovalDiagnostics(
+        success=True,
+        method=method,
+        selected_stage=selected_stage,
+        confidence=confidence,
+        auto_apply=confidence == "high",
+        removed_ratio=1.0 - stats.get("foreground_ratio", 0.0),
+        mask_stats=stats,
+        issues=issues,
+    )
+
+
 def _pixels(img: Image.Image) -> list:
     """获取像素列表（兼容 Pillow 10 与新版 API）。"""
     if hasattr(img, "get_flattened_data"):
