@@ -246,6 +246,37 @@ def main():
     check("无备份时 AI 回退拒绝", status_d2 == 400 and "error" in disc2,
           f"status={status_d2} resp={disc2}")
 
+    # 1e. 实际指针大小（滑动条；未启用时只记录偏好，不碰系统设置）
+    _, st_sz = req("GET", url + "/api/state")
+    orig_applied = st_sz.get("applied_size")
+    check("状态返回实际指针大小",
+          isinstance(orig_applied, int) and 16 <= orig_applied <= 256,
+          f"applied_size={orig_applied}")
+    _, sz = req("POST", url + "/api/applied-size",
+                json.dumps({"size": 48}).encode(),
+                {"Content-Type": "application/json"})
+    check("实际指针大小接口", sz.get("applied_size") == 48, str(sz))
+    _, st_sz2 = req("GET", url + "/api/state")
+    check("实际指针大小状态同步", st_sz2.get("applied_size") == 48)
+    _, sz_small = req("POST", url + "/api/applied-size",
+                      json.dumps({"size": 5}).encode(),
+                      {"Content-Type": "application/json"})
+    check("实际指针大小越界钳制到 32", sz_small.get("applied_size") == 32, str(sz_small))
+    _, sz_mid = req("POST", url + "/api/applied-size",
+                    json.dumps({"size": 72}).encode(),
+                    {"Content-Type": "application/json"})
+    check("实际指针大小吸附到合法 16px 档位",
+          sz_mid.get("applied_size") == 80, str(sz_mid))
+    _, sz_big = req("POST", url + "/api/applied-size",
+                    json.dumps({"size": 300}).encode(),
+                    {"Content-Type": "application/json"})
+    check("实际指针大小上限钳制到 256",
+          sz_big.get("applied_size") == 256, str(sz_big))
+    if orig_applied:
+        req("POST", url + "/api/applied-size",
+            json.dumps({"size": orig_applied}).encode(),
+            {"Content-Type": "application/json"})
+
     # 2b. /api/previews 可恢复读取（紧跟上传，工作帧未变）
     _, pv = req("GET", url + "/api/previews")
     check("previews 接口返回 2 张", len(pv.get("previews", [])) == 2)

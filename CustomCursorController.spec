@@ -23,7 +23,31 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # onnxruntime 的调试/转换子模块会静态引入 torch、scipy、pandas 等，
+    # 程序只使用 onnxruntime.capi 做推理，这些包全都不需要；显式排除可
+    # 避免一次打包把整个 ML 环境卷进来（实测会从 ~46MB 膨胀到 ~250MB）。
+    excludes=[
+        'onnxruntime.transformers',
+        'onnxruntime.quantization',
+        'onnxruntime.tools',
+        'torch',
+        'tensorflow',
+        'tensorboard',
+        'scipy',
+        'pandas',
+        'matplotlib',
+        'sklearn',
+        'sympy',
+        'networkx',
+        'pytest',
+        'botocore',
+        'boto3',
+        'sqlalchemy',
+        'fsspec',
+        'rich',
+        'IPython',
+        'jupyter',
+    ],
     noarchive=False,
     optimize=0,
 )

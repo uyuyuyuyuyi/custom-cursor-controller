@@ -5,6 +5,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, watch, nextTick } 
 const state = reactive({
   enabled: false,
   canvasSize: 64,
+  appliedSize: 32,
   frames: 0,
   hotspot: [24, 28],
   verdict: null,        // 适合 | 有风险 | 不适合
@@ -92,6 +93,7 @@ async function refreshState() {
   const s = await api('/api/state')
   state.enabled = s.enabled
   state.canvasSize = s.canvas_size
+  state.appliedSize = s.applied_size ?? 32
   state.frames = s.frames
   state.hotspot = s.hotspot
   state.verdict = s.verdict
@@ -404,6 +406,25 @@ async function setSize(s) {
     showToast(`光标大小已切换为 ${r.canvas_size}${state.frames ? '' : '（上传图片后生效）'}`)
   } catch (e) {
     error.value = `调整大小失败: ${e.message}`
+  } finally { busy.value = false }
+}
+
+// ── 实际指针大小（滑动条）────────────────────────────
+async function setAppliedSize() {
+  const target = state.appliedSize
+  if (!target) return
+  busy.value = true
+  error.value = ''
+  try {
+    const r = await api('/api/applied-size', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ size: target }),
+    })
+    state.appliedSize = r.applied_size
+    showToast(`实际光标大小已调整为 ${r.applied_size}px`)
+  } catch (e) {
+    error.value = `调整失败: ${e.message}`
   } finally { busy.value = false }
 }
 
@@ -733,10 +754,17 @@ function closeConfirm() {
                 class="preview-canvas" @click="onCanvasClick"
                 :class="{ empty: !state.frames }"></canvas>
         <div class="size-row">
-          <span class="size-lbl">光标大小</span>
+          <span class="size-lbl">画布大小</span>
           <button v-for="s in [48, 64, 96]" :key="s" class="size-btn"
                   :class="{ active: state.canvasSize === s }" :disabled="busy"
                   @click="setSize(s)">{{ s }}</button>
+        </div>
+        <div class="size-row">
+          <span class="size-lbl">实际大小</span>
+          <input class="size-slider" type="range" min="32" max="256" step="16"
+                 v-model.number="state.appliedSize" :disabled="busy"
+                 @change="setAppliedSize" />
+          <span class="size-lbl">{{ state.appliedSize }}px</span>
         </div>
         <div class="meta-row">
           <span class="tag" v-if="state.frames > 1">动画 {{ state.frames }} 帧</span>

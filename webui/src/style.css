@@ -132,7 +132,7 @@ body {
 }
 .preview-canvas.empty { background: #12161c; }
 .meta-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; justify-content: center; }
-.size-row { display: flex; justify-content: center; align-items: center; gap: 6px; margin-top: 10px; }
+.size-row { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px; margin-top: 10px; }
 .size-lbl { font-size: 11px; color: var(--text-dim); margin-right: 2px; }
 .size-btn {
   padding: 3px 12px; font-size: 12px; border-radius: 8px;
@@ -142,6 +142,8 @@ body {
 .size-btn:hover:not(:disabled) { border-color: #3d4a5c; }
 .size-btn.active { color: #fff; border-color: var(--accent); background: rgba(79, 140, 255, .18); }
 .size-btn:disabled { opacity: .5; cursor: not-allowed; }
+.size-slider { width: 150px; accent-color: var(--accent, #4f8cff); cursor: pointer; }
+.size-slider:disabled { opacity: .5; cursor: not-allowed; }
 .preview-actions { display: flex; justify-content: center; gap: 8px; margin-top: 10px; }
 .btn.small { padding: 5px 14px; font-size: 12.5px; }
 .tag {

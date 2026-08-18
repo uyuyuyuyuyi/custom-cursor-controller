@@ -12,6 +12,7 @@ API:
   POST /api/apply          用已暂存帧生成 .ani 并替换系统光标
   POST /api/restore        恢复系统默认光标
   POST /api/hotspot        {x, y} 设置热点，启用中则立即重新生效
+  POST /api/applied-size   {size} 调整实际指针显示尺寸（16~256px，启用中立即生效）
   GET  /api/ai/status      可选 ONNX 智能抠图的状态（依赖/模型/任务进度）
   POST /api/ai/cutout      用 ONNX 模型对当前帧重新抠图（后台任务）
   POST /api/ai/discard     放弃 AI 抠图结果，恢复 AI 前的工作状态与图库快照
@@ -600,6 +601,7 @@ class CursorApp:
 
     def __init__(self, store_root: str | None = None):
         self.mgr = CursorManager()
+        self.applied_size: int = CursorManager.get_base_size()
         self.lock = threading.Lock()
         self.store = CursorStore(root=store_root)
         # 崩溃标记: 上次退出若未干净恢复光标(异常/强杀), 会留下该标记。
@@ -1329,12 +1331,33 @@ class CursorApp:
                     min(size - 1, round(self.hotspot[1] * scale)),
                 )
             if self.enabled:
-                self.mgr.replace_cursor(self._rebuild_ani())
+                self.mgr.replace_cursor(self._rebuild_ani(), self.applied_size)
             return {
                 "canvas_size": size,
                 "hotspot": list(self.hotspot),
                 "enabled": self.enabled,
                 "previews": self._previews_unlocked(),
+            }
+
+    def set_applied_size(self, size: int) -> dict:
+        """调整实际指针显示尺寸（32~256px，按 Windows 16px 档位吸附）。
+
+        启用中会按目标尺寸重建 .ani 并重新挂载自定义光标；
+        未启用时只记录偏好，下次启用时生效。
+        """
+        from cursor_manager import _snap_base_size
+        size = _snap_base_size(size)
+        with self.lock:
+            self.applied_size = size
+            applied = False
+            if self.enabled and self.frames:
+                ani_path = self._rebuild_ani()
+                self.mgr.replace_cursor(ani_path, size)
+                applied = self.mgr.apply_size(size)
+            return {
+                "applied_size": size,
+                "enabled": self.enabled,
+                "applied": applied,
             }
 
     def rotate(self, direction: str) -> dict:
@@ -1357,7 +1380,7 @@ class CursorApp:
             else:
                 raise ValueError("direction 必须是 'ccw' 或 'cw'")
             if self.enabled:
-                self.mgr.replace_cursor(self._rebuild_ani())
+                self.mgr.replace_cursor(self._rebuild_ani(), self.applied_size)
             return {
                 "hotspot": list(self.hotspot),
                 "enabled": self.enabled,
@@ -1383,17 +1406,37 @@ class CursorApp:
         return _feather_alpha_additive(canvas, radius)
 
     # ── 生成 / 应用 / 恢复 ─────────────────────────────
-    def _rebuild_ani(self) -> str:
-        """写入临时 .ani，返回路径。"""
+    def _rebuild_ani(self, display_size: int | None = None) -> str:
+        """写入临时 .ani，返回路径。
+
+        输出位图分辨率取 display_size（默认 self.applied_size），
+        而不是画布尺寸：Windows 实际显示的光标大小等于加载的
+        .ani/.cur 位图大小，SetSystemCursor 在 Win10+ 支持大于
+        32px 的光标；依赖 CursorBaseSize 注册表缩放并不可靠
+        （SPI_SETCURSORS 只重载方案，不重新计算指针缩放）。
+        帧和热点按比例从画布尺寸缩放到目标显示尺寸。
+        """
         import tempfile
         os.makedirs(os.path.join(tempfile.gettempdir(), "custom_cursor_web"), exist_ok=True)
         ani_path = os.path.join(tempfile.gettempdir(), "custom_cursor_web", "custom.ani")
         durations = (self.durations if len(self.durations) == len(self.frames)
                      else [FRAME_MS] * len(self.frames))
+        target = display_size or self.applied_size or self.canvas_size
+        frames = self.frames
+        hotspot = self.hotspot
+        if target != self.canvas_size and frames:
+            scale = target / self.canvas_size
+            frames = [
+                _resize_rgba_premultiplied(f, (target, target)) for f in frames
+            ]
+            hotspot = (
+                min(target - 1, round(hotspot[0] * scale)),
+                min(target - 1, round(hotspot[1] * scale)),
+            )
         save_ani_file(
             ani_path,
-            frames=self.frames,
-            hotspots=[self.hotspot] * len(self.frames),
+            frames=frames,
+            hotspots=[hotspot] * len(frames),
             frame_durations_ms=durations,
             title="Custom Cursor",
             author="Custom Cursor Web",
@@ -1405,7 +1448,9 @@ class CursorApp:
             if not self.frames:
                 raise ValueError("还没有可用图片，请先上传")
             ani_path = self._rebuild_ani()
-            self.mgr.replace_cursor(ani_path)
+            self.mgr.replace_cursor(ani_path, self.applied_size)
+            if self.mgr.get_base_size() != self.applied_size:
+                self.mgr.apply_size(self.applied_size)
             self.enabled = True
             return True
 
@@ -1423,7 +1468,7 @@ class CursorApp:
             n = self.canvas_size - 1
             self.hotspot = (max(0, min(n, x)), max(0, min(n, y)))
             if self.enabled and self.frames:
-                self.mgr.replace_cursor(self._rebuild_ani())
+                self.mgr.replace_cursor(self._rebuild_ani(), self.applied_size)
             return self.enabled
 
     def state(self) -> dict:
@@ -1431,6 +1476,7 @@ class CursorApp:
             return {
                 "enabled": self.enabled,
                 "canvas_size": self.canvas_size,
+                "applied_size": self.applied_size,
                 "frames": len(self.frames),
                 "hotspot": list(self.hotspot),
                 "verdict": self.verdict,
@@ -1514,7 +1560,9 @@ class CursorApp:
             self.removal_diagnostics = None
             self._ai_backup = None
             self.last_cursor_id = cid
-            self.mgr.replace_cursor(ani_path)
+            self.mgr.replace_cursor(self._rebuild_ani(), self.applied_size)
+            if self.mgr.get_base_size() != self.applied_size:
+                self.mgr.apply_size(self.applied_size)
             self.enabled = True
             return {"enabled": True, "name": entry["name"], "cid": cid,
                     "canvas_size": self.canvas_size,
@@ -1760,6 +1808,11 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     length = int(self.headers.get("Content-Length", 0))
                     data = json.loads(self.rfile.read(length) or b"{}")
                     self._send_json(app.set_size(int(data.get("size", DEFAULT_CANVAS_SIZE))))
+                elif path == "/api/applied-size":
+                    length = int(self.headers.get("Content-Length", 0))
+                    data = json.loads(self.rfile.read(length) or b"{}")
+                    self._send_json(app.set_applied_size(
+                        int(data.get("size", 32))))
                 elif path == "/api/ai/cutout":
                     self._send_json(app.start_ai_cutout())
                 elif path == "/api/ai/discard":
