@@ -51,17 +51,19 @@ class OnnxModelMetaTests(unittest.TestCase):
         self.assertNotIn("briaai", onnx_cutout.MODEL_BASE_URL.lower())
         self.assertNotIn("bria", onnx_cutout.MODEL_BASE_URL.lower())
 
-    def test_variants_ordered_by_size_and_have_hashes(self):
-        self.assertEqual(onnx_cutout.MODEL_VARIANTS[0]["name"], "uint8")
+    def test_variants_default_fp16_with_fallbacks(self):
+        names = [v["name"] for v in onnx_cutout.MODEL_VARIANTS]
+        self.assertEqual(names[0], "fp16")          # 默认精度优先
+        self.assertIn("fp32", names)                # 兼容性回退
+        self.assertIn("uint8", names)               # 最小/最快回退
         for variant in onnx_cutout.MODEL_VARIANTS:
             self.assertTrue(variant["sha256"], variant["name"])
             self.assertGreater(variant["size"], 0)
             self.assertTrue(variant["file"].endswith(".onnx"))
-        sizes = [v["size"] for v in onnx_cutout.MODEL_VARIANTS]
-        self.assertEqual(sizes, sorted(sizes))
-        # 体积策略: 默认量化变体应明显小于原始 fp32
         self.assertLess(onnx_cutout.MODEL_VARIANTS[0]["size"],
-                        onnx_cutout.MODEL_VARIANTS[-1]["size"] // 2)
+                        onnx_cutout.MODEL_VARIANTS[1]["size"])
+        self.assertLess(onnx_cutout.MODEL_VARIANTS[2]["size"],
+                        onnx_cutout.MODEL_VARIANTS[0]["size"])
 
 
 @unittest.skipUnless(HAS_NUMPY, "需要 numpy")
@@ -101,6 +103,11 @@ class LazySegmenterTests(unittest.TestCase):
     def test_inference_failure_returns_none(self):
         seg, img = self._segmenter_with_fake_session(0.0)
         seg._session = None  # 无会话 → 加载路径失败 → 返回 None
+
+        def _boom():
+            raise onnx_cutout.ModelDownloadError("no model available")
+
+        seg._ensure_loaded = _boom  # 受控失败，避免测试触发真实下载
         self.assertIsNone(seg.segment(img))
 
     def test_status_reports_model_state(self):
@@ -163,7 +170,7 @@ class DownloadAndCompositeTests(unittest.TestCase):
                     mock.patch.object(onnx_cutout.urllib.request, "urlopen",
                                       return_value=self._FakeResp(payload)):
                 seg = LazyOnnxSegmenter(root)
-                got = seg.download()
+                got = seg.download(variant_name="uint8")
             self.assertEqual(got.read_bytes(), payload)
 
     def test_sha256_file_helper(self):

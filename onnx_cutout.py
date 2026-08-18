@@ -34,16 +34,12 @@ MODEL_LICENSE_URL = "https://www.apache.org/licenses/LICENSE-2.0"
 MODEL_HOMEPAGE = "https://huggingface.co/schirrmacher/ormbg"
 MODEL_PREPROCESS_SIZE = 1024
 
-# 变体按优先级排列: 先量化(44MB), 失败时依次回退 fp16(88MB) / fp32(176MB)。
-# 只有已下载的变体会被尝试加载; 下载接口默认只下载第一个 (uint8)。
+# 变体按优先级排列: 默认 fp16(88MB) 兼顾精度与体积, 失败时依次回退
+# fp32(176MB, 兼容性最好) / uint8(44MB, 最快最小)。
+# 下载接口默认下载第一个 (fp16); 加载时若当前变体缺失或失败,
+# 会自动尝试下载并加载下一个变体。
 MODEL_BASE_URL = "https://huggingface.co/onnx-community/ormbg-ONNX/resolve/main/"
 MODEL_VARIANTS: list[dict] = [
-    {
-        "name": "uint8",
-        "file": "onnx/model_uint8.onnx",
-        "size": 44_315_205,
-        "sha256": "ffbcae62a7b675d616e64cb392ee028786c4cf74f83596590fba13733ef00171",
-    },
     {
         "name": "fp16",
         "file": "onnx/model_fp16.onnx",
@@ -55,6 +51,12 @@ MODEL_VARIANTS: list[dict] = [
         "file": "onnx/model.onnx",
         "size": 176_116_019,
         "sha256": "2830b6f461809cdc7e2f15d19fc1a898b14ad53504640d4147b525d53ebb09c9",
+    },
+    {
+        "name": "uint8",
+        "file": "onnx/model_uint8.onnx",
+        "size": 44_315_205,
+        "sha256": "ffbcae62a7b675d616e64cb392ee028786c4cf74f83596590fba13733ef00171",
     },
 ]
 
@@ -142,7 +144,7 @@ class LazyOnnxSegmenter:
 
     def status(self) -> dict:
         installed, err = onnx_installed()
-        path = self.model_path()
+        default_path = self._dir / MODEL_VARIANTS[0]["file"]
         return {
             "onnx_installed": installed,
             "onnx_error": err,
@@ -154,7 +156,7 @@ class LazyOnnxSegmenter:
                 "homepage": MODEL_HOMEPAGE,
                 "size_mb": round(MODEL_VARIANTS[0]["size"] / (1024 * 1024), 1),
                 "variant": MODEL_VARIANTS[0]["name"],
-                "downloaded": path is not None,
+                "downloaded": default_path.is_file(),
                 "loaded": self._session is not None,
             },
         }
@@ -170,15 +172,22 @@ class LazyOnnxSegmenter:
     # ── 下载 ──────────────────────────────────────────
     def download(
         self,
+        variant_name: str | None = None,
         progress_cb: Callable[[float, str], None] | None = None,
     ) -> Path:
-        """下载默认量化模型（若已存在则直接返回）。失败时清理 .part 文件。"""
+        """下载指定变体（默认 fp16）；已存在则直接返回。失败时清理 .part 文件。"""
         with self._lock:
-            existing = self.model_path()
-            if existing is not None:
-                return existing
-            variant = MODEL_VARIANTS[0]
+            if variant_name is None:
+                variant = MODEL_VARIANTS[0]
+            else:
+                variant = next(
+                    (v for v in MODEL_VARIANTS if v["name"] == variant_name),
+                    None)
+                if variant is None:
+                    raise ModelDownloadError(f"未知模型变体: {variant_name}")
             target = self._dir / variant["file"]
+            if target.is_file():
+                return target
             target.parent.mkdir(parents=True, exist_ok=True)
             part = target.with_suffix(target.suffix + ".part")
             url = MODEL_BASE_URL + variant["file"]
@@ -220,7 +229,14 @@ class LazyOnnxSegmenter:
             for variant in MODEL_VARIANTS:
                 p = self._dir / variant["file"]
                 if not p.is_file():
-                    continue
+                    try:
+                        self.download(variant_name=variant["name"])
+                    except Exception as e:
+                        last_error = f"{variant['name']} 下载失败: {e}"
+                        continue
+                    p = self._dir / variant["file"]
+                    if not p.is_file():
+                        continue
                 try:
                     self._session = ort.InferenceSession(
                         str(p), providers=["CPUExecutionProvider"])
@@ -232,7 +248,7 @@ class LazyOnnxSegmenter:
                 raise ModelDownloadError(
                     "模型尚未下载，请先调用 download()。")
             raise ModelLoadError(
-                f"已下载的模型变体均无法加载: {last_error}")
+                f"所有模型变体均不可用: {last_error}")
 
     def segment(self, img: Image.Image) -> Image.Image | None:
         """对图片推理并返回同尺寸 L 掩码；失败时返回 None（调用方回退）。"""

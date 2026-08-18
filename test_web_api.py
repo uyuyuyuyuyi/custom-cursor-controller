@@ -289,6 +289,10 @@ def main():
           isinstance(ga.get("score"), int) and ga.get("verdict")
           and ga.get("removal_confidence") == "high",
           f"verdict={ga.get('verdict')} score={ga.get('score')}")
+    check("图库应用同步 AI 源帧",
+          len(app.source_frames) == ga["frames"]
+          and len(app.source_diags) == ga["frames"],
+          f"source={len(app.source_frames)} frames={ga['frames']}")
     req("POST", url + "/api/restore")
 
     # 2d. 删除
@@ -711,6 +715,26 @@ def main():
     check("级联删除应用中的光标也恢复系统光标",
           del9.get("restored") is True and st10["enabled"] is False
           and st10["frames"] == 0)
+
+    # 7j. 图库应用后 AI 源帧必须来自原始上传（全分辨率），而不是已抠好的光标帧
+    store2 = tempfile.mkdtemp(prefix="custom_cursor_ai_source_")
+    app2 = CursorApp(store_root=store2)
+    big = Image.new("RGBA", (160, 160), (255, 255, 255, 255))
+    d2 = ImageDraw.Draw(big)
+    d2.ellipse((40, 40, 120, 120), fill=(200, 80, 20, 255))
+    buf2 = io.BytesIO()
+    big.save(buf2, format="PNG")
+    up2 = app2.upload([("big.png", buf2.getvalue())])
+    c2 = up2["cursor_id"]
+    app2.apply_cursor_from_gallery(c2)
+    check("图库应用后 AI 源帧为原始分辨率",
+          app2.source_frames and app2.source_frames[0].size == (160, 160)
+          and app2.frames[0].size == (64, 64),
+          f"source={app2.source_frames[0].size} canvas={app2.frames[0].size}")
+    check("图库应用后 AI 源诊断同步",
+          len(app2.source_diags) == len(app2.source_frames),
+          f"diags={len(app2.source_diags)}")
+    app2.restore()
 
     # 8. 静态首页
     r = urllib.request.urlopen(url + "/", timeout=15)

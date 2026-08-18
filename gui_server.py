@@ -1489,6 +1489,19 @@ class CursorApp:
             self.hotspot = tuple(entry["hotspot"])
             self.durations = self._entry_durations(entry, len(frames), ani_bytes)
             self.src_size = (frames[0].width, frames[0].height)
+            # AI 源帧: 优先从原始上传重建全分辨率帧，避免 AI 在"已抠好的
+            # 64px 光标"上二次抠图导致效果变差；无原始文件时回退到光标帧。
+            rebuilt = self._rebuild_source_frames(entry)
+            if rebuilt is not None:
+                self.source_frames, self.source_diags = rebuilt
+            else:
+                self.source_frames = list(frames)
+                self.source_diags = [
+                    diagnose_alpha_mask(
+                        f.getchannel("A"), self.canvas_size,
+                        method="existing_alpha", selected_stage="existing")
+                    for f in frames
+                ]
             analysis = analyze(frames[0], target_size=self.canvas_size)
             self.verdict = analysis.verdict
             self.score = analysis.score
@@ -1513,6 +1526,40 @@ class CursorApp:
                     "removal_confidence": self.removal_confidence,
                     "auto_apply": self.auto_apply_allowed,
                     "removal_diagnostics": self.removal_diagnostics}
+
+    def _rebuild_source_frames(
+        self, cursor_entry: dict,
+    ) -> tuple[list[Image.Image], list[RemovalDiagnostics]] | None:
+        """从光标关联的原始上传重建 AI 源帧（全分辨率 + 启发式抠图）。
+
+        返回 (frames, removal_diags)；任何一环缺失/帧数不一致时返回 None，
+        由调用方回退到已存的光标帧。
+        """
+        upload_ids = cursor_entry.get("upload_ids") or []
+        if not upload_ids:
+            return None
+        file_items: list[tuple[str, bytes]] = []
+        for uid in upload_ids:
+            up = self.store.get_upload(uid)
+            if not up:
+                return None
+            try:
+                with open(os.path.join(self.store.root, up["filename"]), "rb") as f:
+                    data = f.read()
+            except OSError:
+                return None
+            file_items.append((up.get("original", "图片.png"), data))
+        try:
+            processed, _durations, _info, _verdicts, _worst, diags = \
+                self._process_files(file_items)
+        except Exception:
+            return None
+        if not processed:
+            return None
+        frames = [img for img, _ok in processed]
+        if len(frames) != cursor_entry.get("frames", len(frames)):
+            return None
+        return frames, diags
 
     def delete_gallery(self, kind: str, uid: str,
                        with_uploads: bool = False,
