@@ -18,7 +18,6 @@ const state = reactive({
 })
 
 const tab = ref('console')          // console | gallery
-const galTab = ref('cursors')       // uploads | cursors
 const gallery = reactive({ uploads: [], cursors: [] })
 
 const uploading = ref(false)
@@ -193,11 +192,22 @@ async function applyAiResult(r) {
         error.value = `应用失败: ${e.message}`
       }
     }
-    confirm.action2 = null
-    confirm.action2Label = ''
+    confirm.action2 = discardAiResult
+    confirm.action2Label = '不保留 AI 抠图结果'
     confirm.actionLabel = '仍然应用'
     confirm.cancelAction = null
     confirm.show = true
+  }
+}
+
+async function discardAiResult() {
+  try {
+    await api('/api/ai/discard', { method: 'POST' })
+    await refreshState()
+    await refreshGallery()
+    showToast('已放弃 AI 抠图结果，恢复原抠图')
+  } catch (e) {
+    error.value = `回退失败: ${e.message}`
   }
 }
 
@@ -482,10 +492,11 @@ async function applyCursor(c) {
     const p = await api('/api/previews')
     state.previews = p.previews
     state.frames = r.frames
-    state.verdict = null
-    state.issues = []
-    state.removalConfidence = 'high'
-    state.autoApply = true
+    state.verdict = r.verdict ?? null
+    state.score = r.score ?? null
+    state.issues = r.issues || []
+    state.removalConfidence = r.removal_confidence || 'high'
+    state.autoApply = r.auto_apply === true
     animIndex.value = 0
     startAnim()
     showToast(`已应用光标「${r.name}」`)
@@ -762,9 +773,6 @@ function closeConfirm() {
                    :style="{ width: (state.score || 0) + '%' }"></div>
             </div>
             <span class="score-num">{{ state.score }}/100</span>
-            <span class="score-num" v-if="state.removalConfidence">
-              抠图{{ state.removalConfidence === 'high' ? '高可信' : state.removalConfidence === 'medium' ? '需确认' : '低可信' }}
-            </span>
           </div>
           <ul class="issue-list">
             <li v-for="(it, i) in state.issues" :key="i" :class="it.level">
@@ -790,14 +798,11 @@ function closeConfirm() {
     <!-- ── 图库 ── -->
     <main v-else class="gallery">
       <div class="gal-tabs">
-        <button class="tab small" :class="{ active: galTab === 'cursors' }"
-                @click="galTab = 'cursors'">生成的光标 ({{ gallery.cursors.length }})</button>
-        <button class="tab small" :class="{ active: galTab === 'uploads' }"
-                @click="galTab = 'uploads'">上传的图片 ({{ gallery.uploads.length }})</button>
+        <span class="tab small active">生成的光标 ({{ gallery.cursors.length }})</span>
         <span v-if="state.dataDir" class="gal-dir">存储目录: {{ state.dataDir }}</span>
       </div>
 
-      <div v-if="galTab === 'cursors'" class="grid">
+      <div class="grid">
         <div v-for="c in gallery.cursors" :key="c.id" class="gcard">
           <img class="gthumb" :src="`/api/gallery/cursors/${c.id}/preview`" alt="" />
           <div class="gname" :title="c.name">{{ c.name }}</div>
@@ -815,30 +820,6 @@ function closeConfirm() {
         </div>
         <div v-if="!gallery.cursors.length" class="empty-hint">还没有生成的光标。上传图片后会自动保存到这里。</div>
       </div>
-
-      <div v-else class="grid">
-        <div v-for="u in gallery.uploads" :key="u.id" class="gcard">
-          <img class="gthumb" :src="`/api/gallery/uploads/${u.id}/thumb`" alt="" />
-          <div class="gname" :title="u.original">{{ u.original }}</div>
-          <div class="gmeta">
-            {{ u.size[0] }}×{{ u.size[1] }} · 判定 {{ u.verdict }} ({{ u.score }}分)
-            <span v-if="u.category" class="gcat">#{{ u.category }}</span>
-          </div>
-          <div class="gmeta">
-            <span v-if="cursorsForUpload(u).length" class="gcur has">
-              🖱 已有 {{ cursorsForUpload(u).length }} 个光标
-            </span>
-            <span v-else class="gcur">⚠ 尚未生成光标</span>
-          </div>
-          <div class="gactions">
-            <button v-if="!cursorsForUpload(u).length" class="btn tiny primary"
-                    :disabled="busy" @click="generateFromUpload(u)">生成光标</button>
-            <button class="btn tiny" @click="openCategory('uploads', u)">归类</button>
-            <button class="btn tiny danger" @click="delItem('uploads', u)">删除</button>
-          </div>
-        </div>
-        <div v-if="!gallery.uploads.length" class="empty-hint">还没有上传的图片。</div>
-      </div>
     </main>
 
     <footer class="actionbar">
@@ -851,7 +832,7 @@ function closeConfirm() {
         <span class="hint">上传新图片会自动替换光标；退出时自动恢复系统默认</span>
       </template>
       <template v-else>
-        <span class="hint">上传的图片与生成的光标保存在程序目录的 data 文件夹中，可随时应用 / 重命名 / 归类 / 删除</span>
+        <span class="hint">生成的光标保存在程序数据目录中，可随时应用 / 重命名 / 归类 / 删除；上传的图片原文件仍保留在本地</span>
       </template>
     </footer>
 

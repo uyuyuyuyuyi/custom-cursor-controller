@@ -207,6 +207,45 @@ def main():
           f"files={sorted(os.listdir(tmp_folder))}")
     app.store.delete("cursors", tmp_entry["id"])
 
+    # 1d. AI 回退（无真实模型；注入备份验证恢复逻辑）
+    saved_backup = {
+        "frames": list(app.frames),
+        "durations": list(app.durations),
+        "hotspot": app.hotspot,
+        "verdict": app.verdict,
+        "score": app.score,
+        "issues": list(app.issues),
+        "removal_confidence": app.removal_confidence,
+        "auto_apply_allowed": app.auto_apply_allowed,
+        "removal_diagnostics": app.removal_diagnostics,
+        "src_size": app.src_size,
+        "source_frames": list(app.source_frames),
+        "source_diags": list(app.source_diags),
+        "last_cursor_id": app.last_cursor_id,
+        "gallery": (app.store.cursor_snapshot(app.last_cursor_id)
+                    if app.last_cursor_id else None),
+    }
+    app._ai_backup = saved_backup
+    app.frames = []
+    app.verdict = "不适合"
+    app.score = 0
+    status_d, disc = req("POST", url + "/api/ai/discard")
+    check("AI 回退接口可用", status_d == 200 and disc.get("ok") is True,
+          f"status={status_d} resp={disc}")
+    check("AI 回退恢复工作状态",
+          len(app.frames) == len(saved_backup["frames"])
+          and app.score == saved_backup["score"],
+          f"frames={len(app.frames)} score={app.score}")
+    import urllib.error
+    try:
+        req("POST", url + "/api/ai/discard")
+        status_d2, disc2 = 200, {}
+    except urllib.error.HTTPError as e:
+        status_d2 = e.code
+        disc2 = json.loads(e.read().decode("utf-8"))
+    check("无备份时 AI 回退拒绝", status_d2 == 400 and "error" in disc2,
+          f"status={status_d2} resp={disc2}")
+
     # 2b. /api/previews 可恢复读取（紧跟上传，工作帧未变）
     _, pv = req("GET", url + "/api/previews")
     check("previews 接口返回 2 张", len(pv.get("previews", [])) == 2)
@@ -246,6 +285,10 @@ def main():
     check("图库应用光标 enabled=True", ga["enabled"] is True)
     check("图库应用恢复画布尺寸", ga["canvas_size"] == 64, str(ga["canvas_size"]))
     check("图库应用恢复帧数", ga["frames"] == 2, str(ga["frames"]))
+    check("图库应用保留评分与 AI 状态",
+          isinstance(ga.get("score"), int) and ga.get("verdict")
+          and ga.get("removal_confidence") == "high",
+          f"verdict={ga.get('verdict')} score={ga.get('score')}")
     req("POST", url + "/api/restore")
 
     # 2d. 删除

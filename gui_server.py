@@ -14,6 +14,7 @@ API:
   POST /api/hotspot        {x, y} 设置热点，启用中则立即重新生效
   GET  /api/ai/status      可选 ONNX 智能抠图的状态（依赖/模型/任务进度）
   POST /api/ai/cutout      用 ONNX 模型对当前帧重新抠图（后台任务）
+  POST /api/ai/discard     放弃 AI 抠图结果，恢复 AI 前的工作状态与图库快照
   POST /api/quit           恢复光标并退出程序（关闭窗口时调用）
   GET  /                   静态前端 (webui/dist)
 """
@@ -451,6 +452,41 @@ class CursorStore:
             self._save()
         return entry
 
+    def cursor_snapshot(self, cid: str) -> tuple | None:
+        """读取光标条目的完整快照 (ani, preview, frames_png, meta)。
+
+        用于 AI 抠图前备份，支持"不保留 AI 结果"时精确还原图库条目。
+        """
+        entry = self.index["cursors"].get(cid)
+        if not entry:
+            return None
+        folder = os.path.join(self.cursors_dir, cid)
+        ani_path = os.path.join(folder, "ani")
+        preview_path = os.path.join(folder, "preview.png")
+        if not os.path.isfile(ani_path) or not os.path.isfile(preview_path):
+            return None
+        with open(ani_path, "rb") as f:
+            ani_bytes = f.read()
+        with open(preview_path, "rb") as f:
+            preview_png = f.read()
+        frames_png: list[bytes] = []
+        i = 0
+        while True:
+            p = os.path.join(folder, f"frame_{i}.png")
+            if not os.path.exists(p):
+                break
+            with open(p, "rb") as f:
+                frames_png.append(f.read())
+            i += 1
+        meta = {
+            "size": entry.get("size"),
+            "hotspot": entry.get("hotspot"),
+            "frames": entry.get("frames"),
+            "durations": entry.get("durations"),
+            "animated": entry.get("animated"),
+        }
+        return ani_bytes, preview_png, frames_png, meta
+
     def find_cursor_by_sources(self, source_hashes: list[str]) -> dict | None:
         """按来源内容哈希集合查找已存在的光标（查重）。"""
         target = sorted(source_hashes)
@@ -602,6 +638,7 @@ class CursorApp:
         self.ai_job: dict = {
             "state": "idle", "progress": 0.0, "message": "", "error": None,
         }
+        self._ai_backup: dict | None = None
 
     # ── 上传 → 分析 ────────────────────────────────────
     def _process_files(self, file_items: list[tuple[str, bytes]]):
@@ -762,6 +799,33 @@ class CursorApp:
         threading.Thread(target=self._ai_cutout_worker, daemon=True).start()
         return {"started": True, "job": dict(self.ai_job)}
 
+    def discard_ai_cutout(self) -> dict:
+        """放弃 AI 抠图结果，恢复到 AI 前的工作状态与图库快照。"""
+        with self.lock:
+            backup = self._ai_backup
+            if not backup:
+                raise ValueError("当前没有可回退的 AI 抠图结果")
+            self.frames = backup["frames"]
+            self.durations = backup["durations"]
+            self.hotspot = backup["hotspot"]
+            self.verdict = backup["verdict"]
+            self.score = backup["score"]
+            self.issues = backup["issues"]
+            self.removal_confidence = backup["removal_confidence"]
+            self.auto_apply_allowed = backup["auto_apply_allowed"]
+            self.removal_diagnostics = backup["removal_diagnostics"]
+            self.src_size = backup["src_size"]
+            self.source_frames = backup["source_frames"]
+            self.source_diags = backup["source_diags"]
+            self._ai_backup = None
+            gallery = backup.get("gallery")
+            last_cursor_id = backup.get("last_cursor_id")
+        if gallery and last_cursor_id:
+            ani_bytes, preview_png, frames_png, meta = gallery
+            self.store.refresh_cursor(
+                last_cursor_id, ani_bytes, preview_png, frames_png, meta)
+        return {"ok": True}
+
     def _ai_cutout_worker(self) -> None:
         try:
             with self.lock:
@@ -772,6 +836,24 @@ class CursorApp:
                 durations = list(self.durations)
                 canvas_size = self.canvas_size
                 last_cursor_id = self.last_cursor_id
+                # 备份 AI 前的完整状态，供"不保留 AI 抠图结果"精确回退
+                self._ai_backup = {
+                    "frames": list(self.frames),
+                    "durations": durations,
+                    "hotspot": self.hotspot,
+                    "verdict": self.verdict,
+                    "score": self.score,
+                    "issues": list(self.issues),
+                    "removal_confidence": self.removal_confidence,
+                    "auto_apply_allowed": self.auto_apply_allowed,
+                    "removal_diagnostics": self.removal_diagnostics,
+                    "src_size": self.src_size,
+                    "source_frames": src_frames,
+                    "source_diags": src_diags,
+                    "last_cursor_id": last_cursor_id,
+                    "gallery": (self.store.cursor_snapshot(last_cursor_id)
+                                if last_cursor_id else None),
+                }
 
             def _progress(fraction: float, message: str) -> None:
                 with self.ai_lock:
@@ -960,6 +1042,7 @@ class CursorApp:
             self.src_size = (processed[0][0].width, processed[0][0].height)
             self.source_frames = source_frames
             self.source_diags = removal_diags
+            self._ai_backup = None
             hotspot = self.hotspot  # 锁内快照, 供锁外构建 .ani/预览使用
             canvas_size = self.canvas_size
 
@@ -1152,6 +1235,7 @@ class CursorApp:
             self.src_size = (processed[0][0].width, processed[0][0].height)
             self.source_frames = source_frames
             self.source_diags = removal_diags
+            self._ai_backup = None
             hotspot = self.hotspot  # 锁内快照, 供锁外构建 .ani/预览使用
             canvas_size = self.canvas_size
 
@@ -1405,18 +1489,30 @@ class CursorApp:
             self.hotspot = tuple(entry["hotspot"])
             self.durations = self._entry_durations(entry, len(frames), ani_bytes)
             self.src_size = (frames[0].width, frames[0].height)
-            self.verdict = self.score = None
-            self.issues = []
+            analysis = analyze(frames[0], target_size=self.canvas_size)
+            self.verdict = analysis.verdict
+            self.score = analysis.score
+            self.issues = [
+                {"level": it.level, "code": it.code, "message": it.message}
+                for it in analysis.issues
+            ]
             self.removal_confidence = "high"
             self.auto_apply_allowed = True
             self.removal_diagnostics = None
+            self._ai_backup = None
             self.last_cursor_id = cid
             self.mgr.replace_cursor(ani_path)
             self.enabled = True
             return {"enabled": True, "name": entry["name"], "cid": cid,
                     "canvas_size": self.canvas_size,
                     "hotspot": list(self.hotspot),
-                    "frames": len(frames)}
+                    "frames": len(frames),
+                    "verdict": self.verdict,
+                    "score": self.score,
+                    "issues": self.issues,
+                    "removal_confidence": self.removal_confidence,
+                    "auto_apply": self.auto_apply_allowed,
+                    "removal_diagnostics": self.removal_diagnostics}
 
     def delete_gallery(self, kind: str, uid: str,
                        with_uploads: bool = False,
@@ -1619,6 +1715,8 @@ def make_handler(app: CursorApp, webui_dir: str | None):
                     self._send_json(app.set_size(int(data.get("size", DEFAULT_CANVAS_SIZE))))
                 elif path == "/api/ai/cutout":
                     self._send_json(app.start_ai_cutout())
+                elif path == "/api/ai/discard":
+                    self._send_json(app.discard_ai_cutout())
                 elif path.startswith("/api/gallery/"):
                     self._handle_gallery_action(path)
                 elif path == "/api/quit":
