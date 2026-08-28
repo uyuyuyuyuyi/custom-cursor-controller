@@ -10,6 +10,12 @@ The project started as the 🪳 white animated cockroach cursor, and grew into a
 Programmatically built `.ani` files (pure Python), image analysis & background removal via PIL, installed via the Win32 API — no C compiler, no third-party drawing libraries.
 纯 Python 手工构建 `.ani` 文件，PIL 完成图片分析与抠背景，并通过 Win32 API 注入系统——无需 C 编译器，无第三方绘图库。
 
+## Repository / 仓库说明
+
+This is the independent, actively maintained repository for Custom Cursor Controller. It is not a fork. The earlier [`cockroach-pointer`](https://github.com/uyuyuyuyi/cockroach-pointer) repository is retained only as an archive of the original white-cockroach cursor prototype.
+
+本仓库是 Custom Cursor Controller 的独立主仓库（非 fork），用于持续开发和发布。早期的 [`cockroach-pointer`](https://github.com/uyuyuyuyi/cockroach-pointer) 仓库仅保留最初的白色蟑螂光标原型，不再承载本项目的新功能。
+
 ---
 
 ## ✨ Features / 功能特性

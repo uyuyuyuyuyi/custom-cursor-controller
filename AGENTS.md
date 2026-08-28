@@ -1,7 +1,7 @@
 # AGENTS.md — 项目交接与 Agent 工作说明
 
 本文件既是给后续 Codex / agent 的项目说明，也是跨设备交接说明。
-最后更新：2026-08-19（仓库迁移：cockroach-pointer 存档老版本，custom-cursor-controller 为活仓库）
+最后更新：2026-08-28（独立仓库迁移完成：custom-cursor-controller 为主仓库，cockroach-pointer 为历史存档）
 
 ## 一、这是什么项目
 
@@ -11,15 +11,15 @@ Windows 桌面应用：上传图片/GIF → 自动抠图/适合度分析 → 生
 
 ## 二、仓库与分支
 
-- 主远端 `standalone`：`https://github.com/uyuyuyuyuyi/custom-cursor-controller.git`（**活仓库**；本地 `main` 跟踪 `standalone/main`，日常 pull/push 走这里）
-- 存档远端 `origin`：`https://github.com/uyuyuyuyuyi/cockroach-pointer.git`（**老版本存档**：`main` 停在 `2187322` —— 无 GUI、执行后自动替换白色蟑螂光标的初始版本；只读，不要推它）
+- 主远端 `origin`：`https://github.com/uyuyuyuyi/custom-cursor-controller.git`（**独立活仓库**，GitHub 元数据 `fork: false`；本地 `main` 跟踪 `origin/main`，日常 pull/push 走这里）
+- 存档远端 `archive`：`https://github.com/uyuyuyuyi/cockroach-pointer.git`（**老版本存档**：`main` 停在 `2187322` —— 无 GUI、执行后自动替换白色蟑螂光标的初始版本；只读，不要推它）
 - 默认分支：`main`（已包含本说明）
-- 历史沿革（2026-08-19 迁移）：全部 GUI / 上传图片生成光标开发（自 `d5faec0` 起）归入 custom-cursor-controller（当前 `52dec57`）；cockroach-pointer 回退到老版本 `2187322`；原 cockroach-pointer 上的 `feature/ai-onnx-cutout`、`feature/custom-cursor-gui` 分支已删除，其内容全部保留在 custom-cursor-controller 的 main 历史中
+- 历史沿革：2026-08-19 将全部 GUI / 上传图片生成光标开发（自 `d5faec0` 起）迁入 `custom-cursor-controller`，并将 `cockroach-pointer` 回退到老版本 `2187322`；2026-08-28 完成本地远程整理，将 `custom-cursor-controller` 设为 `origin`、`cockroach-pointer` 改名为 `archive`。原项目中的功能分支已删除，其内容全部保留在 `custom-cursor-controller/main` 历史中。
 
 ## 三、在新设备继续工作
 
 ```bash
-git clone https://github.com/uyuyuyuyuyi/custom-cursor-controller.git
+git clone https://github.com/uyuyuyuyi/custom-cursor-controller.git
 cd custom-cursor-controller
 git checkout main
 git pull
